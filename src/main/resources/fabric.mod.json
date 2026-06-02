@@ -1,24 +1,24 @@
 {
   "schemaVersion": 1,
-  "id": "addon-template",
+  "id": "auto-miner",
   "version": "${version}",
-  "name": "Addon Template",
-  "description": "An addon template for Meteor Client addons.",
+  "name": "AutoMiner",
+  "description": "AFK bulk single-block miner for anarchy servers — Baritone-driven mining with shulker/ender-chest storage and pickaxe restock.",
   "authors": [
-    "seasnail"
+    "Shallowplague"
   ],
   "contact": {
-    "sources": "https://github.com/MeteorDevelopment/meteor-addon-template"
+    "sources": "https://github.com/aquariusnetwork9/auto-miner"
   },
-  "icon": "assets/template/icon.png",
+  "icon": "assets/auto-miner/icon.png",
   "environment": "client",
   "entrypoints": {
     "meteor": [
-      "com.example.addon.AddonTemplate"
+      "com.autominer.AutoMinerAddon"
     ]
   },
   "mixins": [
-    "addon-template.mixins.json"
+    "auto-miner.mixins.json"
   ],
   "custom": {
     "meteor-client:color": "225,25,25",
@@ -29,8 +29,8 @@
     }
   },
   "depends": {
-    "java": ">=${jdk_version}",
-    "minecraft": "${minecraft_version}",
+    "java": ">=21",
+    "minecraft": ["${mc_version}"],
     "meteor-client": "*"
   }
 }
