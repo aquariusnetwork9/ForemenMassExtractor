@@ -9,4 +9,4 @@ pluginManagement {
     }
 }
 
-rootProject.name = 'auto-miner'
+rootProject.name = 'foreman-massextractor'

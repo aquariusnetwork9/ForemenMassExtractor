@@ -1,6 +1,6 @@
-package com.autominer;
+package com.shallowplague.foreman;
 
-import com.autominer.modules.AutoMiner;
+import com.shallowplague.foreman.modules.MassExtractor;
 import com.mojang.logging.LogUtils;
 import meteordevelopment.meteorclient.addons.GithubRepo;
 import meteordevelopment.meteorclient.addons.MeteorAddon;
@@ -8,16 +8,16 @@ import meteordevelopment.meteorclient.systems.modules.Category;
 import meteordevelopment.meteorclient.systems.modules.Modules;
 import org.slf4j.Logger;
 
-public class AutoMinerAddon extends MeteorAddon {
+public class ForemanAddon extends MeteorAddon {
     public static final Logger LOG = LogUtils.getLogger();
-    public static final Category CATEGORY = new Category("Mining");
+    public static final Category CATEGORY = new Category("Foreman");
 
     @Override
     public void onInitialize() {
-        LOG.info("Initializing AutoMiner addon");
+        LOG.info("Initializing Foreman MassExtractor addon");
 
         // Modules
-        Modules.get().add(new AutoMiner());
+        Modules.get().add(new MassExtractor());
     }
 
     @Override
@@ -27,11 +27,11 @@ public class AutoMinerAddon extends MeteorAddon {
 
     @Override
     public String getPackage() {
-        return "com.autominer";
+        return "com.shallowplague.foreman";
     }
 
     @Override
     public GithubRepo getRepo() {
-        return new GithubRepo("aquariusnetwork9", "auto-miner");
+        return new GithubRepo("aquariusnetwork9", "foreman-massextractor");
     }
 }

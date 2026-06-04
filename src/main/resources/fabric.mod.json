@@ -1,24 +1,24 @@
 {
   "schemaVersion": 1,
-  "id": "auto-miner",
+  "id": "foreman-massextractor",
   "version": "${version}",
-  "name": "AutoMiner",
+  "name": "Foreman MassExtractor",
   "description": "AFK bulk single-block miner for anarchy servers — Baritone-driven mining with shulker/ender-chest storage and pickaxe restock.",
   "authors": [
     "Shallowplague"
   ],
   "contact": {
-    "sources": "https://github.com/aquariusnetwork9/auto-miner"
+    "sources": "https://github.com/aquariusnetwork9/foreman-massextractor"
   },
-  "icon": "assets/auto-miner/icon.png",
+  "icon": "assets/foreman-massextractor/icon.png",
   "environment": "client",
   "entrypoints": {
     "meteor": [
-      "com.autominer.AutoMinerAddon"
+      "com.shallowplague.foreman.ForemanAddon"
     ]
   },
   "mixins": [
-    "auto-miner.mixins.json"
+    "foreman-massextractor.mixins.json"
   ],
   "custom": {
     "meteor-client:color": "225,25,25",

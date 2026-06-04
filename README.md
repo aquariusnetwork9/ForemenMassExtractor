@@ -1,140 +1,92 @@
-# Meteor Addon Template
+# Foreman MassExtractor
 
-A template to allow easy usage of the Meteor Addon API.
+An AFK bulk miner for Minecraft 1.21.4, built as a [Meteor Client](https://meteorclient.com/) addon and aimed at anarchy servers (2b2t, 6b6t, and the like). By Shallowplague.
 
-### How to use
+You point it at an area, walk away, and come back to a stack of full shulkers. It digs out the blocks, packs the haul into shulkers inside an ender chest, swaps in a fresh pickaxe when the old one wears down, and keeps going until the area is done or your storage is full.
 
-#### Use GitHub Template (Recommended)
+## What it does
 
-- Click the green `Use this template` button in the top right corner of this page.  
-  This will create a new repository with this template and a clean history.
+- Mines a whole area, not one block at a time. It clears the ground in chunk-sized boxes and works outward, so it won't run off chasing a block on the far side of the map.
+- Actually collects the drops. It digs in small boxes and walks back over the ground it just cleared, so the blocks land in your inventory instead of despawning on the floor.
+- Stores everything for you. Fills shulkers inside an ender chest, then gets back to mining.
+- Or hauls to a base (optional). Once the ender chest is full of filled shulkers, it can pull them back out and haul them to chests at your base, drop them off in the nearest one, restock empty shulkers from a separate supply chest, and head back — a near-unlimited run.
+- Refuels its own tools. Grabs a fresh pickaxe when the old one wears down — either loose ones in the ender chest, or, if you turn it on, from a whole shulker of spare pickaxes kept in the chest (it places that shulker, takes a tool, and puts it back).
+- Throws out the trash. Junk blocks and risky foods (rotten flesh, stews, poison/teleport foods) get dropped; normal food is kept so AutoEat can use it.
+- Handles caves. It will drop down into caverns to reach the blocks instead of getting stuck on the edge.
+- Knows when to quit. When there are no empty shulkers left, or a set area is fully cleared, it stops — and can log you off the server if you want.
 
-#### Clone Manually
+It runs on any Baritone, including the one bundled with Meteor. No special build required.
 
-- Alternatively, clone this repository using these commands for a clean history:
-  ```bash
-  git clone --depth 1 https://github.com/MeteorDevelopment/meteor-addon-template your-addon-name
-  cd your-addon-name
-  rm -rf .git
-  git init
-  git add .
-  git commit -m "Initial commit from template"
-  ```
+## What to bring
 
-#### Development
+Before you turn it on, have these on you:
 
-- Use this template to add custom modules, commands, HUDs, and other features to Meteor Client.
-- To test, run the `Minecraft Client` configuration in your IDE.
-  This will start a Minecraft client with the Meteor Client mod and your addon loaded.
-- To build, run the gradle `build` task. This will create a JAR file in the `build/libs` folder.
-    - Move the JAR file to the `mods` folder of your Minecraft installation, alongside the Meteor Client mod and run the
-      game.
+- A pickaxe (it mines deepslate by default), plus a few spares in the ender chest — either loose, or in a shulker if you turn on **restock-from-shulker** (lets one chest slot hold a whole shulker of pickaxes).
+- One or more ender chests in your inventory.
+- Empty shulker boxes inside the ender chest.
+- Optional: food for AutoEat, and totems if you're running near caves or lava.
 
-### Updating to newer Minecraft versions
+## How to turn it on
 
-To update this template to a newer Minecraft version, follow these steps:
+1. Stand where you want to start mining.
+2. Open the Meteor menu and find **Mass Extractor** under the **Foreman** category (or bind it to a key).
+3. Click it on. That's it — it starts mining straight away.
 
-1. Ensure a Meteor Client snapshot is available for the new Minecraft version.
-2. Update `gradle/libs.versions.toml` (the versions catalog):
-    - Set the version entries to the new versions. Common keys to update are:
-        - `versions.minecraft` - Minecraft version
-        - `versions.yarn-mappings` - Yarn mappings
-        - `versions.fabric-loader` - Fabric loader version
-        - `versions.meteor` - Meteor Client snapshot version
-    - If your addon depends on other libraries listed under the `[libraries]` section, update their versions there as
-      needed.
-    - After editing, refresh Gradle dependencies and rebuild your project in the IDE.
-3. Update Loom:
-    - Change the `loom` version in `gradle/libs.versions.toml` (the `versions.loom` entry) to the latest version
-      compatible with the new Minecraft version.
-4. Update the Gradle wrapper:
-    - Run the wrapper update command for your platform. Examples:
-      - Unix / macOS / Windows (Powershell): `./gradlew wrapper --gradle-version <version> && ./gradlew wrapper`
-      - Windows (cmd.exe): `gradlew.bat wrapper --gradle-version <version> && gradlew.bat wrapper`
-    - This updates and regenerates the Gradle Wrapper scripts (`gradlew`, `gradlew.bat`, etc.) for the specified version.
-5. Update your source code:
-    - Adjust for Minecraft or Yarn mapping changes: method names, imports, mixins, etc.
-    - Check for Meteor Client API changes that may affect your addon by comparing against the
-      [master branch](https://github.com/MeteorDevelopment/meteor-client/tree/master).
-6. Build and test:
-    - Run the gradle `build` task.
-    - Confirm the build succeeds and your addon works with the new Minecraft version.
+To stop, click it off. Anything it changed in Baritone gets put back the way you had it.
 
-### Project structure
+## Setting a mining area
 
-```text
-.
-│── .github
-│   ╰── workflows
-│       │── dev_build.yml
-│       ╰── pull_request.yml
-│── gradle
-│   │── libs.versions.toml
-│   ╰── wrapper
-│       │── gradle-wrapper.jar
-│       ╰── gradle-wrapper.properties
-│── src
-│   ╰── main
-│       │── java
-│       │   ╰── com
-│       │       ╰── example
-│       │           ╰── addon
-│       │               │── commands
-│       │               │   ╰── CommandExample
-│       │               │── hud
-│       │               │   ╰── HudExample
-│       │               │── modules
-│       │               │   ╰── ModuleExample
-│       │               ╰── AddonTemplate
-│       ╰── resources
-│           │── assets
-│           │   ╰── template
-│           │       ╰── icon.png
-│           │── addon-template.mixins.json
-│           ╰── fabric.mod.json
-│── .editorconfig
-│── .gitignore
-│── build.gradle.kts
-│── gradle.properties
-│── gradlew
-│── gradlew.bat
-│── LICENSE
-│── README.md
-╰── settings.gradle.kts
-```
+By default it mines outward forever from where you started. If you'd rather it stay in one spot, turn on **limit-area** and pick how you want to mark the box:
 
-This is the default project structure. Each folder/file has a specific purpose.  
-Here is a brief explanation of the ones you might need to modify:
+**ChunksFromStart** — set the size in chunks and where you stand decides the rest. No clicking.
+- `area-anchor = Center`: the box is centered on you. Good for "clear everything around me."
+- `area-anchor = Corner`: you're standing at a corner and the box grows out in the direction you're facing. Set the width and length the same for a square — for example 5×5 chunks mines an 80×80 block square in front of you.
 
-- `.github/workflows`: Contains the GitHub Actions configuration files.
-- `gradle`: Contains the Gradle wrapper files and the versions catalog.  
-  - `libs.versions.toml`: Defines version numbers for Minecraft, Loom, Meteor, and other dependencies.
-  - `wrapper`: Contains the Gradle wrapper executable files.  
-    To update the Gradle wrapper executable itself, run the wrapper update command (examples are shown above).
-- `src/main/java/com/example/addon`: Contains the main class of the addon.  
-  Here you can register your custom commands, modules, and HUDs.  
-  Edit the `getPackage` method to reflect the package of your addon.
-- `src/main/resources`: Contains the resources of the addon.
-    - `assets`: Contains the assets of the addon.  
-      You can add your own assets here, separated in subfolders.
-        - `template`: Contains the assets of the template.  
-          You can replace the `icon.png` file with your own addon icon.  
-          Also, rename this folder to reflect the name of your addon.
-    - `addon-template.mixins.json`: Contains the Mixin configuration for the addon.  
-      You can add your own mixins in the `client` array.
-    - `fabric.mod.json`: Contains the metadata of the addon.  
-      Edit the various fields to reflect the metadata of your addon.
-- `build.gradle.kts`: Contains the Gradle build script.  
-  You can manage the dependencies of the addon here.  
-  Remember to keep the `fabric-loom` version up-to-date.
-- `gradle.properties`: Contains additional build properties used by the build script
-  (for example `maven_group` and `archives_base_name`).  
-  Dependency and platform version numbers are stored in `gradle/libs.versions.toml`.
-- `LICENSE`: Contains the license of the addon.  
-  You can edit this file to change the license of your addon.
-- `README.md`: Contains the documentation of the addon.  
-  You can edit this file to reflect the documentation of your addon, and showcase its features.
+**CornerSelect** — mark the two corners by hand, like Meteor's Excavator.
+1. Turn the module on (it waits for you to mark the area).
+2. Look at one corner block and press the selection key (right mouse by default).
+3. Look at the opposite corner and press it again.
+The box shows up as you aim, and mining starts as soon as both corners are set.
 
-## License
+When a set area is fully cleared, it packs up whatever it's still holding and stops.
 
-This template is available under the CC0 license. Feel free to use it for your own projects.
+## Cave handling
+
+Deepslate depth is full of caves. Normally Baritone refuses to drop down to reach blocks across a cavern and either takes the long way around or gives up. With **cave-handling** on (the default), it's allowed to fall into caves to mine them out. It will never walk or fall into lava, and it puts your Baritone movement settings back to normal when you switch the module off.
+
+If you've got good armor and totems you can push the fall height higher and turn on parkour for even more reach. If you'd rather play it safe, lower the fall height or turn cave handling off entirely.
+
+## Hauling to base chests
+
+In every mode the **ender chest is the field buffer**: empty shulkers are pulled out of it, filled, and the filled shulkers stored straight back into it — they never pile up in the working inventory while mining. By default the run just ends when the ender chest is full. If you'd rather pile the haul up at a base for an unlimited run, set **deposit-target** (in the **Deposit chests** group):
+
+- **EnderChest** — the default. Filled shulkers stay in your ender chest; the run ends when it's full. Best for "just fill a few shulkers."
+- **DepositChests** — same field cycle, but once the ender chest runs out of empties (it's full of filled shulkers) the bot pulls them back out, walks to the nearest **deposit chest**, drops them off, then goes to a separate **supply chest** to grab fresh empty shulkers, comes back, and keeps mining.
+- **EnderChestThenChests** — same as DepositChests (kept for compatibility).
+
+Set the locations in-game: aim at a chest and press **mark-deposit** (default K) for a drop-off chest, or **mark-supply** (default L) for an empty-shulker chest. Mark as many as you want — the bot uses the nearest and skips any that are full or unreachable. Locations are saved between runs.
+
+Good to know:
+- Keep your **deposit** chests (filled shulkers) and **supply** chests (spare empty shulkers) as separate chests.
+- The **batch size per trip** is just how many empty shulkers you keep stocked in the ender chest — load it with the number you want filled before each trip (and **empties-per-trip** controls how many it grabs to refill).
+- You still carry an ender chest item — it dispenses the empties, holds the filled shulkers between trips, and restocks tools.
+- **max-deposit-distance** caps how far it will travel for a chest; past that it pauses instead of crossing the map.
+- Turn off **refill-empties** if you only want drop-offs and no supply runs (the run then ends when your empties run out).
+- Build a **ladder** (or vine) shaft from the mining depth up to your base — Baritone climbs ladders automatically, so it's the cleanest way up to the chests. Nothing to enable.
+
+## Safety
+
+- It won't mine below a floor you set, so it can't dig itself into bedrock.
+- It pauses if lava ends up next to it or another player comes close.
+- It spaces out its actions on purpose, so it doesn't get ahead of a laggy or high-ping server and desync.
+
+## Settings at a glance
+
+- **General** — what to mine, what to keep, the floor height, action timing, and how thoroughly it sweeps for drops (`clear-box-size` — smaller boxes pick up more; `mining-reach` — lower makes it stand closer and collect more).
+- **Area** — the area limit, the two area modes, sizes, and the corner-select key.
+- **Storage** — when to start packing, dropping junk and bad food, and auto-disconnect.
+- **Deposit chests** — haul filled shulkers out of the ender chest to base chests once it's full: the mode, the deposit/supply chest lists and their mark keys, empty refills (`empties-per-trip`), and travel distance cap.
+- **Tools** — which tool to restock, at what durability, and whether to pull spares from a tool-shulker in the ender chest.
+- **Safety** — lava and player pause settings.
+- **Cave handling** — fall height and parkour/diagonal movement.
+- **Rendering** — the area box colors and style.
