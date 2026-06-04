@@ -528,16 +528,19 @@ public class MassExtractor extends Module {
 
     /**
      * Sub-phases of a deposit trip (the {@link State#DEPOSIT} state). The filled shulkers live in the
-     * ender chest (the field buffer), so a trip first EXTRACTs them: place the echest → open → pull the
-     * filled loot shulkers into the inventory → break the echest. Then a deposit leg (drop them at the
-     * nearest deposit chest), and — if refilling — a supply leg (take empty shulkers from the nearest,
-     * separate, supply chest, which the next echest cycle stocks back into the ender chest), then head
-     * back to mining.
+     * ender chest (the field buffer) and STAY there until the bot is standing at the deposit chest — so a
+     * death on the way to base never strands the haul (it's in the global ender chest, not the bot's
+     * inventory). Order: walk to the nearest deposit chest with a clean inventory → at the chest, EXTRACT
+     * the filled loot shulkers out of the echest (place echest → open → pull → break) → dump them into the
+     * deposit chest → (if refilling) walk to the nearest, separate, supply chest and take ONLY as many
+     * empties as will fit in the echest → STOCK those empties straight into the echest → back to mining.
      */
     private enum DepositPhase {
-        PULL_PLACE, PULL_OPEN, PULL_FILLED, PULL_CLOSE, PULL_BREAK,   // extract filled loot shulkers from the echest
-        PATH_TO_DEPOSIT, OPEN_DEPOSIT, DEPOSIT_FILLED, CLOSE_DEPOSIT,
-        PATH_TO_SUPPLY, OPEN_SUPPLY, TAKE_EMPTIES, CLOSE_SUPPLY,
+        PATH_TO_DEPOSIT,                                             // walk to the deposit chest (inv clean; filled stay safe in the echest)
+        PULL_PLACE, PULL_OPEN, PULL_FILLED, PULL_CLOSE, PULL_BREAK,  // at the chest: extract the filled loot shulkers out of the echest
+        OPEN_DEPOSIT, DEPOSIT_FILLED, CLOSE_DEPOSIT,                 // dump them into the deposit chest
+        PATH_TO_SUPPLY, OPEN_SUPPLY, TAKE_EMPTIES, CLOSE_SUPPLY,     // refill empties (only as many as fit in the echest)
+        STOCK_PLACE, STOCK_OPEN, STOCK_EMPTIES, STOCK_CLOSE, STOCK_BREAK, // put those empties into the ender chest
         DONE
     }
 
@@ -606,6 +609,9 @@ public class MassExtractor extends Module {
     private int depositTravelTicks = 0;
     private BlockPos lastTravelPos = null;
     private boolean finishAfterDeposit = false; // bounded-area final drop-off: stop once this trip ends
+    private boolean tripExtracted = false;      // the filled shulkers have been pulled out of the echest this trip
+    private boolean tripRefilled = false;       // this trip stocked at least one empty shulker back into the echest
+    private int echestFreeAfterExtract = 0;     // echest free slots after the extract = how many empties may refill
 
     public MassExtractor() {
         super(ForemanAddon.CATEGORY, "mass-extractor", "AFK bulk single-block miner with shulker/echest storage and tool restock.");
@@ -631,12 +637,14 @@ public class MassExtractor extends Module {
         restockAbort = null;
         depositActive = (depositTarget.get() != DepositTarget.EnderChest);
         echestExhausted = false;
-        depositPhase = DepositPhase.PULL_PLACE;
+        depositPhase = DepositPhase.PATH_TO_DEPOSIT;
         depositChest = null;
         triedChests.clear();
         lastTravelPos = null;
         depositTravelTicks = 0;
         finishAfterDeposit = false;
+        tripExtracted = false;
+        echestFreeAfterExtract = 0;
 
         // CornerSelect: don't mine yet — sit in SELECT until the player marks both corners
         // (handled in selectCorners(), which resolves the box and starts mining).
@@ -1184,9 +1192,11 @@ public class MassExtractor extends Module {
                 if (playerSlot < 0) { step = 3; timer = nextDelay(); return; } // nothing left to store
                 if (!containerHasRoomFor(h, h.slots.get(playerSlot).getStack())) { // echest full of shulkers
                     if (depositActive) {
-                        // Full of filled shulkers IS the trip trigger. Keep the leftover filled shulker in
-                        // hand (the trip's deposit leg drops it too) and head out to a deposit chest.
+                        // Full of filled shulkers IS the trip trigger. Recover the echest with a clean
+                        // inventory, then resumeMining() starts the deposit trip (so we never keep mining
+                        // and pack the inventory with blocks before there's room to pull the shulkers out).
                         echestExhausted = true;
+                        info("Ender chest is full of filled shulkers — heading out on a deposit trip.");
                         closeScreen();
                         go(State.BREAK_ECHEST); timer = nextDelay(); return;
                     }
@@ -1205,6 +1215,7 @@ public class MassExtractor extends Module {
                         && findContainerSlot(h, this::isEmptyShulker) == -1
                         && countShulkers(this::isEmptyShulkerInInv) == 0) {
                     echestExhausted = true;
+                    info("Used the last empty shulker — ender chest is full; making a deposit trip.");
                 }
                 closeScreen();
                 if (!echestExhausted && countShulkers(this::isEmptyShulkerInInv) > 0 && hasTargetStacks()) go(State.PLACE_SHULKER);
@@ -1284,55 +1295,63 @@ public class MassExtractor extends Module {
     // ---------------- Deposit-chest trips (optional) ----------------
     // The ender chest is the FIELD buffer: during mining, filled shulkers are stored into it and empties
     // taken from it (exactly like the EnderChest cycle). A trip only happens once the echest runs out of
-    // empties (it's full of filled shulkers). The trip first EXTRACTs those filled shulkers back out of
-    // the echest (place echest -> open -> pull -> break), walks to the nearest DEPOSIT chest and dumps
-    // them, then (if refill-empties is on) walks to the nearest SUPPLY chest — a separate chest — and
-    // pulls a fresh batch of empty shulkers, and heads back to mining (clearArea re-paths to the box; the
-    // next echest cycle stocks those empties back into the ender chest). Every leg has a stuck-timeout
-    // that moves on to the next chest or pauses, so a wrong/blocked/out-of-range chest can't hang the run.
+    // empties (it's full of filled shulkers) — detected the moment the last empty is used, with a clean
+    // inventory, so the bot never keeps mining and packs blocks before there's room to extract. The trip
+    // walks to the nearest DEPOSIT chest FIRST with an empty inventory (the filled shulkers stay safe in
+    // the global echest until the bot is there — a death en route can't strand them), then at the chest
+    // EXTRACTs the filled shulkers out of the echest (place echest -> open -> pull -> break) and dumps
+    // them in. If refill-empties is on it then walks to the nearest SUPPLY chest — a separate chest — and
+    // takes ONLY as many empties as will fit in the echest after the deposit, STOCKs those straight into
+    // the echest, and heads back to mining. Every leg has a stuck-timeout that moves on to the next chest
+    // or pauses, so a wrong/blocked/out-of-range chest can't hang the run.
 
     private boolean hasAnyEmptyShulker() { return countShulkers(this::isEmptyShulkerInInv) > 0; }
 
-    /** Whether a trip should include the supply leg (top up empties toward empties-per-trip). */
-    private boolean needEmpties() {
-        return refillEmpties.get() && countShulkers(this::isEmptyShulkerInInv) < emptiesPerTrip.get();
-    }
-
-    /** Begin a deposit trip: first crack the ender chest open and pull the filled shulkers back out. */
+    /** Begin a deposit trip: walk to the nearest deposit chest FIRST — the filled shulkers stay in the
+     *  ender chest (global) until the bot is standing at the chest, so a death en route can't strand them. */
     private void beginDepositTrip() {
         stopMining();
         triedChests.clear();
         depositTravelTicks = 0;
         lastTravelPos = null;
+        tripExtracted = false;
+        tripRefilled = false;
+        echestFreeAfterExtract = 0;
         go(State.DEPOSIT);
-        if (countItem(Items.ENDER_CHEST) == 0) {
-            // No ender chest to crack open — can only deposit anything we happen to already carry.
-            routeAfterExtract();
-            return;
-        }
-        setDepositPhase(DepositPhase.PULL_PLACE);
-        info("Deposit trip: collecting the filled shulkers out of the ender chest.");
+        if (countItem(Items.ENDER_CHEST) == 0) { pause("No ender chest in inventory to open the shulker buffer."); return; }
+        depositChest = nearestChest(depositChestList());
+        if (depositChest == null) { pause(noChestMsg(depositChestList(), "deposit")); return; }
+        setDepositPhase(DepositPhase.PATH_TO_DEPOSIT);
+        info("Deposit trip: walking to the deposit chest at %d, %d, %d (filled shulkers stay in the ender chest until I'm there).",
+            depositChest.getX(), depositChest.getY(), depositChest.getZ());
     }
 
-    /** After the filled shulkers are out of the echest: deposit leg if carrying any, else the supply leg. */
-    private void routeAfterExtract() {
-        if (countShulkers(this::isLootFilledShulker) > 0) {
-            depositChest = nearestChest(depositChestList());
-            if (depositChest == null) { pause(noChestMsg(depositChestList(), "deposit")); return; }
-            setDepositPhase(DepositPhase.PATH_TO_DEPOSIT);
-            info("Heading to deposit chest at %d, %d, %d.", depositChest.getX(), depositChest.getY(), depositChest.getZ());
-        } else if (!finishAfterDeposit && needEmpties()) {
-            depositChest = nearestChest(supplyChestList());
-            if (depositChest == null) { pause(noChestMsg(supplyChestList(), "supply")); return; }
-            setDepositPhase(DepositPhase.PATH_TO_SUPPLY);
-            info("Heading to supply chest at %d, %d, %d.", depositChest.getX(), depositChest.getY(), depositChest.getZ());
+    /** Empties to take this trip: capped to what will fit in the echest after the deposit (and empties-per-trip). */
+    private int tripEmptiesTarget() {
+        return Math.min(emptiesPerTrip.get(), echestFreeAfterExtract);
+    }
+
+    /** Go stock carried empties into the echest, or finish the trip if there are none. */
+    private void gotoStockOrDone() {
+        if (countShulkers(this::isEmptyShulkerInInv) > 0 && countItem(Items.ENDER_CHEST) > 0) {
+            tripRefilled = true;                 // we obtained empties; they'll be stocked into the echest
+            setDepositPhase(DepositPhase.STOCK_PLACE);
+        } else setDepositPhase(DepositPhase.DONE);
+    }
+
+    /** After the filled shulkers are dumped: refill empties (if wanted and the echest has room), else stock/finish. */
+    private void afterDeposit() {
+        if (!finishAfterDeposit && refillEmpties.get()
+                && tripEmptiesTarget() > 0
+                && countShulkers(this::isEmptyShulkerInInv) < tripEmptiesTarget()) {
+            startSupplyLeg();
         } else {
-            setDepositPhase(DepositPhase.DONE);   // nothing to drop off and no refill needed
+            gotoStockOrDone();
         }
         timer = nextDelay();
     }
 
-    // ----- EXTRACT leg: place the ender chest, pull the filled loot shulkers out, break it -----
+    // ----- EXTRACT leg (standing at the deposit chest): place the echest, pull the filled loot shulkers out, break it -----
 
     private void tickPullPlace() {
         switch (tickPlace(s -> s.getItem() == Items.ENDER_CHEST)) {
@@ -1354,8 +1373,10 @@ public class MassExtractor extends Module {
         if (!isContainerOpen()) { pause("Ender chest closed unexpectedly (collecting filled shulkers)."); return; }
         ScreenHandler h = mc.player.currentScreenHandler;
         int slot = findContainerSlot(h, this::isLootFilledShulker);
-        if (slot < 0) { setDepositPhase(DepositPhase.PULL_CLOSE); timer = nextDelay(); return; }      // pulled them all
-        if (emptyMainSlots() == 0 && freeHotbarSlot() == -1) { setDepositPhase(DepositPhase.PULL_CLOSE); timer = nextDelay(); return; } // inventory full (rare)
+        if (slot < 0 || (emptyMainSlots() == 0 && freeHotbarSlot() == -1)) {   // pulled them all (or inventory full, rare)
+            echestFreeAfterExtract = echestFreeSlots(h);                        // record how many empties may be refilled
+            setDepositPhase(DepositPhase.PULL_CLOSE); timer = nextDelay(); return;
+        }
         quickMove(h, slot);                   // echest -> player inventory
         timer = fillMoveDelay();
     }
@@ -1368,7 +1389,54 @@ public class MassExtractor extends Module {
             return;
         }
         placedEchest = null;
-        routeAfterExtract();
+        tripExtracted = true;
+        if (countShulkers(this::isLootFilledShulker) > 0) {
+            setDepositPhase(DepositPhase.OPEN_DEPOSIT);  // open the deposit chest and dump them
+            timer = nextDelay();
+        } else {
+            afterDeposit();                              // echest held no filled shulkers (edge) — skip the dump
+        }
+    }
+
+    // ----- STOCK leg: put the refilled empty shulkers into the ender chest (so the echest stays the field supply) -----
+
+    private void tickStockPlace() {
+        switch (tickPlace(s -> s.getItem() == Items.ENDER_CHEST)) {
+            case DONE -> { placedEchest = pendingPlace; dbg("placed ender chest at %s (stock)", placedEchest.toShortString()); setDepositPhase(DepositPhase.STOCK_OPEN); timer = nextDelay(); }
+            case FAILED -> pause("Couldn't place the ender chest to stock empty shulkers.");
+            case BUSY -> {}
+        }
+    }
+
+    private void tickStockOpen() {
+        if (step == 0) { openBlock(placedEchest); step = 1; timer = nextDelay(); }
+        else if (isContainerOpen()) { setDepositPhase(DepositPhase.STOCK_EMPTIES); timer = nextDelay(); }
+        else if (++attempts >= 20) pause("Ender chest didn't open (stocking empty shulkers).");
+        else timer = nextDelay();
+    }
+
+    /** Push carried empty shulkers into the open echest, one per tick (they fit — the take was capped to the free space). */
+    private void tickStockEmpties() {
+        if (!isContainerOpen()) { pause("Ender chest closed unexpectedly (stocking empty shulkers)."); return; }
+        ScreenHandler h = mc.player.currentScreenHandler;
+        int playerSlot = findPlayerSlotInContainer(h, this::isEmptyShulkerStack);
+        if (playerSlot < 0 || !containerHasRoomFor(h, h.slots.get(playerSlot).getStack())) { // all stocked (or echest full)
+            setDepositPhase(DepositPhase.STOCK_CLOSE); timer = nextDelay(); return;
+        }
+        quickMove(h, playerSlot);
+        timer = fillMoveDelay();
+    }
+
+    private void tickStockClose() { closeScreen(); setDepositPhase(DepositPhase.STOCK_BREAK); timer = nextDelay(); }
+
+    private void tickStockBreak() {
+        if (placedEchest != null && mc.world.getBlockState(placedEchest).getBlock() == Blocks.ENDER_CHEST) {
+            BlockUtils.breakBlock(placedEchest, true); // continuous until it pops
+            return;
+        }
+        placedEchest = null;
+        setDepositPhase(DepositPhase.DONE);
+        timer = nextDelay();
     }
 
     private String noChestMsg(java.util.List<BlockPos> list, String kind) {
@@ -1387,22 +1455,22 @@ public class MassExtractor extends Module {
 
     private void tickDeposit() {
         switch (depositPhase) {
+            case PATH_TO_DEPOSIT, PATH_TO_SUPPLY -> tickDepositTravel();
             case PULL_PLACE -> tickPullPlace();
             case PULL_OPEN -> tickPullOpen();
             case PULL_FILLED -> tickPullFilled();
             case PULL_CLOSE -> tickPullClose();
             case PULL_BREAK -> tickPullBreak();
-            case PATH_TO_DEPOSIT, PATH_TO_SUPPLY -> tickDepositTravel();
             case OPEN_DEPOSIT, OPEN_SUPPLY -> tickDepositOpen();
             case DEPOSIT_FILLED -> tickDepositFilled();
             case TAKE_EMPTIES -> tickTakeEmpties();
-            case CLOSE_DEPOSIT -> {
-                closeScreen();
-                if (needEmpties() && !finishAfterDeposit) startSupplyLeg(); // final drop-off skips refilling
-                else setDepositPhase(DepositPhase.DONE);
-                timer = nextDelay();
-            }
-            case CLOSE_SUPPLY -> { closeScreen(); setDepositPhase(DepositPhase.DONE); timer = nextDelay(); }
+            case STOCK_PLACE -> tickStockPlace();
+            case STOCK_OPEN -> tickStockOpen();
+            case STOCK_EMPTIES -> tickStockEmpties();
+            case STOCK_CLOSE -> tickStockClose();
+            case STOCK_BREAK -> tickStockBreak();
+            case CLOSE_DEPOSIT -> { closeScreen(); afterDeposit(); }
+            case CLOSE_SUPPLY -> { closeScreen(); gotoStockOrDone(); timer = nextDelay(); }
             default -> { // DONE: head back to mining (clearArea re-paths to the box). Guard against spinning.
                 if (finishAfterDeposit) {           // bounded-area final trip: last haul delivered, stop now
                     finishAfterDeposit = false;
@@ -1410,8 +1478,9 @@ public class MassExtractor extends Module {
                     go(State.DONE);
                     return;
                 }
-                if (depositActive && !hasAnyEmptyShulker()) {
-                    // came back from a trip with no empty shulkers to keep mining with
+                if (depositActive && !tripRefilled) {
+                    // trip stocked no empties into the echest (supply empty / refill off) -> can't keep mining.
+                    // Pause now rather than mine a full load of blocks first and get stuck with no empty to pack.
                     pause(refillEmpties.get()
                         ? "Out of empty shulkers — no supply chest had any."
                         : "Out of empty shulkers, and refill-from-chests is off.");
@@ -1434,7 +1503,10 @@ public class MassExtractor extends Module {
         }
         if (Math.sqrt(mc.player.getBlockPos().getSquaredDistance(depositChest)) <= 4.0) {
             baritone.getPathingBehavior().cancelEverything();
-            setDepositPhase(supplyLeg ? DepositPhase.OPEN_SUPPLY : DepositPhase.OPEN_DEPOSIT);
+            if (supplyLeg) setDepositPhase(DepositPhase.OPEN_SUPPLY);
+            // first time at a deposit chest: pull the filled shulkers out of the echest here; if we've
+            // already extracted (moved on to another deposit chest because the first filled up), just open it.
+            else setDepositPhase(tripExtracted ? DepositPhase.OPEN_DEPOSIT : DepositPhase.PULL_PLACE);
             timer = nextDelay();
             return;
         }
@@ -1473,10 +1545,11 @@ public class MassExtractor extends Module {
         timer = fillMoveDelay();
     }
 
-    /** Pull empty shulkers out of the open supply chest, one per tick, up to empties-per-trip. */
+    /** Pull empty shulkers out of the open supply chest, one per tick, up to what will fit in the echest. */
     private void tickTakeEmpties() {
         if (!isContainerOpen()) { pause("Supply chest closed unexpectedly."); return; }
-        if (countShulkers(this::isEmptyShulkerInInv) >= emptiesPerTrip.get()) { setDepositPhase(DepositPhase.CLOSE_SUPPLY); timer = nextDelay(); return; }
+        // only take as many empties as will fit in the (now mostly empty) ender chest after the deposit
+        if (countShulkers(this::isEmptyShulkerInInv) >= tripEmptiesTarget()) { setDepositPhase(DepositPhase.CLOSE_SUPPLY); timer = nextDelay(); return; }
         if (emptyMainSlots() == 0 && freeHotbarSlot() == -1) { setDepositPhase(DepositPhase.CLOSE_SUPPLY); timer = nextDelay(); return; } // inventory full
         ScreenHandler h = mc.player.currentScreenHandler;
         int slot = findContainerSlot(h, this::isEmptyShulker);
@@ -1484,7 +1557,7 @@ public class MassExtractor extends Module {
             closeScreen();
             triedChests.add(depositChest);
             BlockPos next = nearestChest(supplyChestList());
-            if (next == null) { setDepositPhase(DepositPhase.DONE); return; } // take what we already grabbed
+            if (next == null) { gotoStockOrDone(); timer = nextDelay(); return; } // stock what we already grabbed
             depositChest = next; depositTravelTicks = 0; lastTravelPos = null;
             setDepositPhase(DepositPhase.PATH_TO_SUPPLY); timer = nextDelay();
             return;
@@ -1498,8 +1571,8 @@ public class MassExtractor extends Module {
         triedChests.clear();
         BlockPos s = nearestChest(supplyChestList());
         if (s == null) {
-            // No reachable supply chest: finish if we still have empties, else pause.
-            if (hasAnyEmptyShulker()) setDepositPhase(DepositPhase.DONE);
+            // No reachable supply chest: stock any empties we already carry, else pause.
+            if (hasAnyEmptyShulker()) gotoStockOrDone();
             else pause(noChestMsg(supplyChestList(), "supply"));
             return;
         }
@@ -1513,10 +1586,10 @@ public class MassExtractor extends Module {
         BlockPos next = nearestChest(supplyLeg ? supplyChestList() : depositChestList());
         if (next == null) {
             if (supplyLeg) {
-                if (hasAnyEmptyShulker()) setDepositPhase(DepositPhase.DONE);
+                if (hasAnyEmptyShulker()) gotoStockOrDone();
                 else pause("No reachable supply chest with empty shulkers.");
             } else {
-                if (countShulkers(this::isLootFilledShulker) == 0) setDepositPhase(DepositPhase.DONE);
+                if (countShulkers(this::isLootFilledShulker) == 0) gotoStockOrDone();
                 else pause("No reachable deposit chest with room.");
             }
             return;
@@ -2234,6 +2307,14 @@ public class MassExtractor extends Module {
             if (p.test(slot.getStack())) return i;
         }
         return -1;
+    }
+
+    /** Count the empty slots in the container half (used to size a refill to the echest's free space). */
+    private int echestFreeSlots(ScreenHandler h) {
+        int containerSlots = h.slots.size() - 36;
+        int free = 0;
+        for (int i = 0; i < containerSlots; i++) if (h.slots.get(i).getStack().isEmpty()) free++;
+        return free;
     }
 
     /**

@@ -9,7 +9,7 @@ You point it at an area, walk away, and come back to a stack of full shulkers. I
 - Mines a whole area, not one block at a time. It clears the ground in chunk-sized boxes and works outward, so it won't run off chasing a block on the far side of the map.
 - Actually collects the drops. It digs in small boxes and walks back over the ground it just cleared, so the blocks land in your inventory instead of despawning on the floor.
 - Stores everything for you. Fills shulkers inside an ender chest, then gets back to mining.
-- Or hauls to a base (optional). Once the ender chest is full of filled shulkers, it can pull them back out and haul them to chests at your base, drop them off in the nearest one, restock empty shulkers from a separate supply chest, and head back — a near-unlimited run.
+- Or hauls to a base (optional). Once the ender chest is full of filled shulkers, it walks to the nearest base chest (haul stays safe in the ender chest until it arrives), unloads the filled shulkers there, restocks empty shulkers from a separate supply chest, and heads back — a near-unlimited run.
 - Refuels its own tools. Grabs a fresh pickaxe when the old one wears down — either loose ones in the ender chest, or, if you turn it on, from a whole shulker of spare pickaxes kept in the chest (it places that shulker, takes a tool, and puts it back).
 - Throws out the trash. Junk blocks and risky foods (rotten flesh, stews, poison/teleport foods) get dropped; normal food is kept so AutoEat can use it.
 - Handles caves. It will drop down into caverns to reach the blocks instead of getting stuck on the edge.
@@ -61,14 +61,21 @@ If you've got good armor and totems you can push the fall height higher and turn
 In every mode the **ender chest is the field buffer**: empty shulkers are pulled out of it, filled, and the filled shulkers stored straight back into it — they never pile up in the working inventory while mining. By default the run just ends when the ender chest is full. If you'd rather pile the haul up at a base for an unlimited run, set **deposit-target** (in the **Deposit chests** group):
 
 - **EnderChest** — the default. Filled shulkers stay in your ender chest; the run ends when it's full. Best for "just fill a few shulkers."
-- **DepositChests** — same field cycle, but once the ender chest runs out of empties (it's full of filled shulkers) the bot pulls them back out, walks to the nearest **deposit chest**, drops them off, then goes to a separate **supply chest** to grab fresh empty shulkers, comes back, and keeps mining.
-- **EnderChestThenChests** — same as DepositChests (kept for compatibility).
+- **DepositChests** — same field cycle, but once the ender chest runs out of empties (it's full of filled shulkers) the bot makes a base trip. **EnderChestThenChests** — same as DepositChests (kept for compatibility).
+
+The trip is ordered so the haul is never at risk on an anarchy server:
+
+1. The instant the bot uses its **last empty shulker** (and packs it), the trip starts — it never keeps mining and fills up with blocks first.
+2. It walks to the nearest **deposit chest** with an **empty inventory** — the filled shulkers stay in the ender chest (global) the whole way, so dying en route can't strand them.
+3. **At** the deposit chest it pulls the filled shulkers out of the ender chest and drops them in.
+4. It walks to a separate **supply chest** and takes **only as many empty shulkers as will fit** back in the ender chest.
+5. It puts those empties straight **into the ender chest** and heads back to mining.
 
 Set the locations in-game: aim at a chest and press **mark-deposit** (default K) for a drop-off chest, or **mark-supply** (default L) for an empty-shulker chest. Mark as many as you want — the bot uses the nearest and skips any that are full or unreachable. Locations are saved between runs.
 
 Good to know:
 - Keep your **deposit** chests (filled shulkers) and **supply** chests (spare empty shulkers) as separate chests.
-- The **batch size per trip** is just how many empty shulkers you keep stocked in the ender chest — load it with the number you want filled before each trip (and **empties-per-trip** controls how many it grabs to refill).
+- The **batch size per trip** is just how many empty shulkers you keep stocked in the ender chest — load it with the number you want filled before each trip (and **empties-per-trip** caps how many it refills, never more than fit in the echest).
 - You still carry an ender chest item — it dispenses the empties, holds the filled shulkers between trips, and restocks tools.
 - **max-deposit-distance** caps how far it will travel for a chest; past that it pauses instead of crossing the map.
 - Turn off **refill-empties** if you only want drop-offs and no supply runs (the run then ends when your empties run out).
