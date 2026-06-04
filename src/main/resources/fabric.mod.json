@@ -8,7 +8,7 @@
     "Shallowplague"
   ],
   "contact": {
-    "sources": "https://github.com/aquariusnetwork9/foreman-massextractor"
+    "sources": "https://github.com/aquariusnetwork9/ForemenMassExtractor"
   },
   "icon": "assets/foreman-massextractor/icon.png",
   "environment": "client",
