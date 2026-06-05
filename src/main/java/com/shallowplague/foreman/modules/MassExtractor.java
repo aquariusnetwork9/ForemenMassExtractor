@@ -886,6 +886,16 @@ public class MassExtractor extends Module {
         pushBaritone(s, "failuretimeoutms", 1000L);
         pushBaritone(s, "planaheadfailuretimeoutms", 1000L);
 
+        // Mine TOP-DOWN, always. Stock clearArea is nearest-first, which digs to the bottom of the box and
+        // works upward. buildInLayers clears one Y-layer at a time; layerOrder=true makes that order top to
+        // bottom (BuilderProcess: "if (layerOrder.value) { // top to bottom"). breakFromAbove lets the bot
+        // stand on the layer and break the block directly below it (the reach loop starts at dy=-1), which
+        // is what makes descending layer-by-layer actually work. All restored on deactivate.
+        pushBaritone(s, "buildinlayers", true);
+        pushBaritone(s, "layerorder", true);   // true = top to bottom
+        pushBaritone(s, "layerheight", 1);     // one block per layer (full top-down sweep)
+        pushBaritone(s, "breakfromabove", true);
+
         // Cave handling: relax fall/jump limits so the bot drops into caverns to reach blocks. Lava is
         // never walked/fallen into regardless (those moves stay cost-infinity), and we force
         // assume-walk-on-lava off so a stray config can't make it lava-walk.
@@ -899,7 +909,7 @@ public class MassExtractor extends Module {
             dbg("pushed cave settings: maxFall=%d parkour=%b parkourPlace=%b diagDesc=%b diagAsc=%b",
                 maxFallHeight.get(), allowParkour.get(), allowParkourPlace.get(), allowDiagonalDescend.get(), allowDiagonalAscend.get());
         }
-        dbg("pushed baritone (stock): allowbreak=true failTO=1000ms caveHandling=%b floorY=%d", caveHandling.get(), minYLevel.get());
+        dbg("pushed baritone (stock): allowbreak=true topDown=true(buildInLayers+layerOrder+breakFromAbove) failTO=1000ms caveHandling=%b floorY=%d", caveHandling.get(), minYLevel.get());
     }
 
     /**
