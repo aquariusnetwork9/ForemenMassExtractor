@@ -1,9 +1,11 @@
 package com.shallowplague.foreman;
 
+import com.shallowplague.foreman.hud.ForemanScanHud;
 import com.shallowplague.foreman.modules.MassExtractor;
 import com.mojang.logging.LogUtils;
 import meteordevelopment.meteorclient.addons.GithubRepo;
 import meteordevelopment.meteorclient.addons.MeteorAddon;
+import meteordevelopment.meteorclient.systems.hud.Hud;
 import meteordevelopment.meteorclient.systems.modules.Category;
 import meteordevelopment.meteorclient.systems.modules.Modules;
 import org.slf4j.Logger;
@@ -18,6 +20,9 @@ public class ForemanAddon extends MeteorAddon {
 
         // Modules
         Modules.get().add(new MassExtractor());
+
+        // HUD — the pre-mining resource scan readout (Systems are already initialised by now)
+        Hud.get().register(ForemanScanHud.INFO);
     }
 
     @Override

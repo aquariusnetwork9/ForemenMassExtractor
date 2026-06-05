@@ -4,6 +4,7 @@ import baritone.api.BaritoneAPI;
 import baritone.api.IBaritone;
 import baritone.api.Settings;
 import com.shallowplague.foreman.ForemanAddon;
+import com.shallowplague.foreman.hud.ScanData;
 import meteordevelopment.meteorclient.events.meteor.KeyEvent;
 import meteordevelopment.meteorclient.events.meteor.MouseButtonEvent;
 import meteordevelopment.meteorclient.events.render.Render3DEvent;
@@ -30,6 +31,7 @@ import net.minecraft.item.BlockItem;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.registry.Registries;
 import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.slot.Slot;
@@ -41,6 +43,7 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.chunk.ChunkStatus;
 
 import org.lwjgl.glfw.GLFW;
 import org.slf4j.Logger;
@@ -707,9 +710,11 @@ public class MassExtractor extends Module {
         finishAfterDeposit = false;
         tripExtracted = false;
         echestFreeAfterExtract = 0;
+        ScanData.clear();   // forget the previous run's scan; the new one runs once the area is resolved
 
         // CornerSelect: don't mine yet — sit in SELECT until the player marks both corners
-        // (handled in selectCorners(), which resolves the box and starts mining).
+        // (handled in selectCorners(), which resolves the box and starts mining). The scan runs there,
+        // once the box is known.
         if (limitArea.get() && areaMode.get() == AreaMode.CornerSelect) {
             areaLimited = true;
             go(State.SELECT);
@@ -719,6 +724,7 @@ public class MassExtractor extends Module {
 
         resolveArea();   // unbounded spiral, or a ChunksFromStart box centred on the activation chunk
         seedSpiral();
+        runChunkScan();  // one-time resource scan of the mining area (after the bounds are resolved)
         go(State.MINING);
         startMining();
     }
@@ -813,6 +819,7 @@ public class MassExtractor extends Module {
             info("Corner 2 set: %d, %d, %d — mining the area now.", pos.getX(), pos.getY(), pos.getZ());
             resolveAreaFromCorners();
             seedSpiral();
+            runChunkScan();  // one-time resource scan of the just-marked area
             go(State.MINING);
             startMining();
         }
@@ -1839,6 +1846,94 @@ public class MassExtractor extends Module {
         startCZ = (gridCzMin + gridCzMax) >> 1;
         dbg("resolveAreaFromCorners: box x[%d..%d] y[%d..%d] z[%d..%d] grid x[%d..%d] z[%d..%d] center[%d,%d]",
             areaMinX, areaMaxX, areaMinY, areaMaxY, areaMinZ, areaMaxZ, gridCxMin, gridCxMax, gridCzMin, gridCzMax, startCX, startCZ);
+    }
+
+    // ---------------- Pre-mining resource scan (HUD) ----------------
+
+    /**
+     * Scan the mining area ONCE (at activation, before mining) and publish the most-abundant blocks/ores
+     * to {@link ScanData} for the Resource Scan HUD. The footprint is EXACTLY the area being mined: for a
+     * limited area it's the resolved box [areaMin..areaMax]; for the unbounded spiral it's just the chunk
+     * the run starts in (there's no finite area to total). The vertical span is the mining band
+     * [floor..maxY] — never above the area's maxY. Only loaded chunks are read (we can't see ungenerated
+     * ones client-side), and a block budget caps the work so a huge area can't freeze the game.
+     */
+    private void runChunkScan() {
+        if (mc.world == null) return;
+        int topY = areaLimited ? areaMaxY : quarryTopY;        // never higher than the area's maxY
+        int botY = areaLimited ? areaMinY : minYLevel.get();
+        int x1, z1, x2, z2;
+        if (areaLimited) {
+            x1 = areaMinX; z1 = areaMinZ; x2 = areaMaxX; z2 = areaMaxZ;
+        } else {
+            int bx = startCX << 4, bz = startCZ << 4;
+            x1 = bx; z1 = bz; x2 = bx + 15; z2 = bz + 15;
+        }
+
+        java.util.HashMap<Block, Integer> counts = new java.util.HashMap<>();
+        int chunksScanned = 0;
+        long budget = 0;
+        final long BUDGET_MAX = 16_000_000L;                   // hard cap on blocks visited (anti-freeze)
+        BlockPos.Mutable p = new BlockPos.Mutable();
+
+        for (int cx = (x1 >> 4); cx <= (x2 >> 4); cx++) {
+            for (int cz = (z1 >> 4); cz <= (z2 >> 4); cz++) {
+                var chunk = mc.world.getChunkManager().getChunk(cx, cz, ChunkStatus.FULL, false);
+                if (chunk == null) continue;                   // not loaded — can't read it client-side
+                chunksScanned++;
+                int bxMin = Math.max(x1, cx << 4), bxMax = Math.min(x2, (cx << 4) + 15);
+                int bzMin = Math.max(z1, cz << 4), bzMax = Math.min(z2, (cz << 4) + 15);
+                for (int bx = bxMin; bx <= bxMax; bx++) {
+                    for (int bz = bzMin; bz <= bzMax; bz++) {
+                        for (int by = botY; by <= topY; by++) {
+                            if (++budget > BUDGET_MAX) { publishScan(counts, chunksScanned, botY, topY); return; }
+                            p.set(bx, by, bz);
+                            var st = chunk.getBlockState(p);
+                            if (st.isAir()) continue;          // ignore air (it dominates a quarry otherwise)
+                            Block b = st.getBlock();
+                            if (b == Blocks.WATER || b == Blocks.LAVA) {
+                                if (!st.getFluidState().isStill()) continue; // count only SOURCE fluids, skip flowing
+                            }
+                            counts.merge(b, 1, Integer::sum);
+                        }
+                    }
+                }
+            }
+        }
+        publishScan(counts, chunksScanned, botY, topY);
+    }
+
+    /** Rank the tallied blocks into the top 3 non-ore blocks + top 5 ores and hand them to the HUD. */
+    private void publishScan(java.util.Map<Block, Integer> counts, int chunks, int botY, int topY) {
+        java.util.List<java.util.Map.Entry<Block, Integer>> blockE = new java.util.ArrayList<>();
+        java.util.List<java.util.Map.Entry<Block, Integer>> oreE = new java.util.ArrayList<>();
+        for (var e : counts.entrySet()) (isOreBlock(e.getKey()) ? oreE : blockE).add(e);
+        java.util.Comparator<java.util.Map.Entry<Block, Integer>> byCountDesc =
+            (a, b) -> Integer.compare(b.getValue(), a.getValue());
+        blockE.sort(byCountDesc);
+        oreE.sort(byCountDesc);
+
+        java.util.List<ScanData.Count> blocks = new java.util.ArrayList<>();
+        java.util.List<ScanData.Count> ores = new java.util.ArrayList<>();
+        for (int i = 0; i < Math.min(3, blockE.size()); i++) blocks.add(toCount(blockE.get(i)));
+        for (int i = 0; i < Math.min(5, oreE.size()); i++) ores.add(toCount(oreE.get(i)));
+
+        ScanData.topBlocks = blocks;
+        ScanData.topOres = ores;
+        ScanData.summary = String.format("%d chunk%s · y%d..%d", chunks, chunks == 1 ? "" : "s", botY, topY);
+        ScanData.valid = true;
+        dbg("chunk scan: %d chunks, y[%d..%d], %d block types (%d ore types)", chunks, botY, topY, counts.size(), oreE.size());
+        info("Pre-mine scan done (%d chunk%s) — see the 'Resource Scan' HUD element.", chunks, chunks == 1 ? "" : "s");
+    }
+
+    private ScanData.Count toCount(java.util.Map.Entry<Block, Integer> e) {
+        return new ScanData.Count(e.getKey().getName().getString(), e.getValue());
+    }
+
+    /** An ore for the scan: any "*_ore" block (coal/iron/.../deepslate & nether variants), plus ancient debris. */
+    private boolean isOreBlock(Block b) {
+        if (b == Blocks.ANCIENT_DEBRIS) return true;
+        return Registries.BLOCK.getId(b).getPath().contains("_ore");
     }
 
     /**

@@ -16,6 +16,7 @@ You point it at an area, walk away, and come back to a stack of full shulkers. I
 - Throws out the trash. Junk blocks and risky foods (rotten flesh, stews, poison/teleport foods) get dropped; normal food is kept so AutoEat can use it.
 - Handles caves. It will drop down into caverns to reach the blocks instead of getting stuck on the edge.
 - Knows when to quit. When there are no empty shulkers left, or a set area is fully cleared, it stops — and can log you off the server if you want.
+- Tells you what's down there. When you start it, it scans the mining area once and shows the 3 most abundant blocks and 5 most abundant ores (with counts) in a **Resource Scan** HUD element.
 
 It runs on any Baritone, including the one bundled with Meteor. No special build required.
 
@@ -85,6 +86,15 @@ Good to know:
 - **max-deposit-distance** caps how far it will travel for a chest; past that it pauses instead of crossing the map.
 - Turn off **refill-empties** if you only want drop-offs and no supply runs (the run then ends when your empties run out).
 - Build a **ladder** (or vine) shaft from the mining depth up to your base — Baritone climbs ladders automatically, so it's the cleanest way up to the chests. Nothing to enable.
+
+## Resource scan (HUD)
+
+When you turn the module on, it does a **one-time scan of the mining area** before it starts digging and shows you what's there. Add the **Resource Scan** element from Meteor's HUD editor (the same place as the other HUD elements) to see:
+
+- the **3 most abundant blocks** and the **5 most abundant ores** in the area, each with a count;
+- counts are capped to 6 digits (deepslate runs into the hundreds of thousands, so a 7‑digit count shows as `999999+`).
+
+It scans exactly the area it's about to mine: with **limit-area** on, that's the box you selected (ChunksFromStart or the two CornerSelect corners); with limit-area off (infinite spiral) it scans the chunk you start in. The scan never reaches above the area's **maxY**, ignores air, and counts **water source blocks**. Only loaded chunks are scanned (the game can't read ungenerated ones), so stand in/near the area when you start it.
 
 ## Safety
 
