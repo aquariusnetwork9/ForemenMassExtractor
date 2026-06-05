@@ -182,6 +182,15 @@ public class MassExtractor extends Module {
         .build()
     );
 
+    private final Setting<Integer> areaLayerHeight = sgArea.add(new IntSetting.Builder()
+        .name("layer-height")
+        .description("Bounded areas only. Mine the area in HORIZONTAL layers this many blocks tall, top-down: the bot clears this slice across the WHOLE area (corner to corner, in clear-box-size cells) before dropping to the next slice — so it never tunnels one cell down to minY while the rest of the area stands untouched. 1 = peel one block-level at a time across the whole area (most even surface + best drop pickup, but the most repositioning/travel). Larger = fewer full-area passes (faster), but it digs this many blocks deep at each spot before moving on. Set it to your full Y band height (maxY-minY+1) for the old per-cell full-height behaviour. Unlimited areas can't pre-sweep an infinite top, so they always clear full-height per chunk.")
+        .defaultValue(1)
+        .min(1).max(64).sliderRange(1, 32)
+        .visible(limitArea::get)
+        .build()
+    );
+
     private final Setting<Keybind> selectionBind = sgArea.add(new KeybindSetting.Builder()
         .name("selection-bind")
         .description("CornerSelect only: the button used to mark the two corners. After enabling the module, point at a block and press it once for the first corner, again for the second; mining starts once both are set. Defaults to right mouse button (same as Excavator).")
@@ -321,6 +330,13 @@ public class MassExtractor extends Module {
         .name("restock-tool")
         .description("Which tool to pull from the ender chest when yours runs low. Auto derives it from your target blocks (sand/gravel → shovel, deepslate/stone → pickaxe, logs → axe).")
         .defaultValue(ToolType.Auto)
+        .build()
+    );
+
+    private final Setting<Boolean> alsoRestockShovel = sgTools.add(new BoolSetting.Builder()
+        .name("also-restock-shovel")
+        .description("Also keep a fresh SHOVEL on hand (on top of the main restock-tool) so gravel/sand in the quarry is mined FAST with the right tool instead of slogged through with a pickaxe. Topped up opportunistically whenever the ender chest is open during a storage cycle — keep a few spare shovels loose in the echest. Best-effort: a missing shovel never pauses the run (unlike the main tool). Off, or when the main tool is already a shovel, this does nothing.")
+        .defaultValue(true)
         .build()
     );
 
@@ -598,8 +614,9 @@ public class MassExtractor extends Module {
     private boolean areaLimited = false;
     private int areaMinX, areaMaxX, areaMinZ, areaMaxZ, areaMinY, areaMaxY;
     private int gridCxMin, gridCxMax, gridCzMin, gridCzMax; // chunk grid covering the box
-    private int areaChunksTotal, areaChunksDone;            // progress + area-complete detection
-    private boolean areaComplete = false;                   // every in-box chunk cleared/skipped
+    private int areaChunksTotal, areaChunksDone;            // progress (per horizontal layer) + layer-complete detection
+    private int curLayerTopY = 0;                           // bounded area: top Y of the layer currently being swept (descends top-down)
+    private boolean areaComplete = false;                   // every layer down to areaMinY cleared/skipped
     // CornerSelect: the two corners marked via the selection bind (null until set this run).
     private BlockPos corner1 = null, corner2 = null;
 
@@ -1787,22 +1804,38 @@ public class MassExtractor extends Module {
             areaMinX, areaMaxX, areaMinY, areaMaxY, areaMinZ, areaMaxZ, gridCxMin, gridCxMax, gridCzMin, gridCzMax, startCX, startCZ);
     }
 
-    /** Reset the outward-square spiral stepper to the centre (startCX/startCZ) and clear clear-area state. */
-    private void seedSpiral() {
+    /**
+     * Reset the outward-square spiral stepper to the centre (startCX/startCZ) and clear the per-pass
+     * clear-area cursor. Called at the start of the run AND at the start of each new horizontal layer,
+     * so every layer re-sweeps the whole area's chunks from the centre out.
+     */
+    private void resetSpiralStepper() {
         spX = 0; spZ = 0; spDir = 0; spSegLen = 1; spSegLeft = 1; spSegDone = 0;
         curCX = startCX; curCZ = startCZ;
-        clearAreaStarted = false;
-        clearAreaStallTicks = 0;
-        lastClearPos = null;
         subBoxes.clear();
         subBoxIdx = 0;
         areaChunksDone = 0;
+    }
+
+    /** Seed the whole run: reset the spiral, the stall watch, and start at the TOP layer (descends down). */
+    private void seedSpiral() {
+        resetSpiralStepper();
+        clearAreaStarted = false;
+        clearAreaStallTicks = 0;
+        lastClearPos = null;
         areaComplete = false;
+        curLayerTopY = areaMaxY;               // bounded: sweep from the top layer downward
         areaChunksTotal = areaLimited
             ? (gridCxMax - gridCxMin + 1) * (gridCzMax - gridCzMin + 1)
             : 0;
-        dbg("seedSpiral: center[%d,%d] areaChunksTotal=%d", startCX, startCZ, areaChunksTotal);
+        dbg("seedSpiral: center[%d,%d] areaChunksTotal=%d topLayerY=%d layerH=%d", startCX, startCZ, areaChunksTotal, curLayerTopY, layerThickness());
     }
+
+    /** Vertical thickness of each top-down horizontal layer (bounded areas), clamped to >= 1. */
+    private int layerThickness() { return Math.max(1, areaLayerHeight.get()); }
+
+    /** Y floor of the layer currently being swept (bounded), clamped to the area floor. */
+    private int curLayerBottomY() { return Math.max(areaMinY, curLayerTopY - layerThickness() + 1); }
 
     /**
      * Sign (+1/-1) of the player's horizontal facing on each axis {x, z}, used by the Corner anchor to
@@ -1848,10 +1881,14 @@ public class MassExtractor extends Module {
         if (subBoxes.isEmpty()) subBoxes.add(new int[]{ x1, z1, x2, z2 }); // safety (degenerate bounds)
     }
 
-    /** Issue clearArea for the current sub-box over the quarry's Y band, and reset the stall watch. */
+    /**
+     * Issue clearArea for the current sub-box, and reset the stall watch. Bounded areas mine ONE
+     * horizontal layer at a time (the [curLayerBottomY..curLayerTopY] slice), so the whole area's top
+     * is swept before descending — the unbounded spiral still clears the full Y band per chunk.
+     */
     private void issueSubBox() {
-        int y1 = areaLimited ? areaMinY : minYLevel.get();
-        int y2 = areaLimited ? areaMaxY : quarryTopY;
+        int y1 = areaLimited ? curLayerBottomY() : minYLevel.get();
+        int y2 = areaLimited ? curLayerTopY      : quarryTopY;
         int[] b = subBoxes.get(subBoxIdx);
         callClearArea(new BlockPos(b[0], y1, b[1]), new BlockPos(b[2], y2, b[3]));
         clearAreaStallTicks = 0;
@@ -1905,9 +1942,10 @@ public class MassExtractor extends Module {
     }
 
     /**
-     * The current chunk box is finished (cleared) or abandoned (stalled). Count it toward the bounded
-     * area, then either end the run (all in-box chunks done) or step the spiral to the next chunk and
-     * start it. For the infinite spiral it always advances. Returns true if it routed to area-complete.
+     * The current chunk box is finished (cleared) or abandoned (stalled). For a bounded area, count it
+     * toward the CURRENT LAYER; once every chunk in the layer is done, drop one layer and re-sweep the
+     * whole area (or finish the run once we've cleared down to areaMinY). For the infinite spiral it just
+     * advances to the next chunk (full-height). Returns true if it routed to area-complete.
      */
     private boolean afterChunk(boolean stalled) {
         if (debugLog.get()) {
@@ -1916,8 +1954,18 @@ public class MassExtractor extends Module {
                 curCX, curCZ, stalled ? "stalled" : "cleared", c[0], c[1]);
         }
         if (areaLimited && ++areaChunksDone >= areaChunksTotal) {
-            onAreaComplete();
-            return true;
+            // Whole-area horizontal layer cleared. Drop to the next layer and re-sweep, or — once the
+            // next layer would start below the area floor — the area is fully mined.
+            if (curLayerBottomY() <= areaMinY) {
+                onAreaComplete();
+                return true;
+            }
+            curLayerTopY -= layerThickness();
+            resetSpiralStepper();                              // re-sweep every chunk at the new, lower layer
+            info("Layer cleared — dropping to y[%d..%d] and sweeping the area.", curLayerBottomY(), curLayerTopY);
+            startClearArea();
+            timer = nextDelay();
+            return false;
         }
         advanceSpiral();
         info(stalled ? "Skipped chunk — moving to chunk [%d, %d]." : "Chunk cleared — moving to chunk [%d, %d].", curCX, curCZ);
@@ -2109,18 +2157,22 @@ public class MassExtractor extends Module {
 
     // ---------------- Tool restock ----------------
 
+    /**
+     * Top up every tool type we keep stocked from the OPEN ender chest: the main restock-tool, plus a
+     * shovel when 'also-restock-shovel' is on. Best-effort — a missing secondary tool only logs, it never
+     * pauses the run (the dedicated tool-shulker cycle still guards the PRIMARY tool).
+     */
     private void restockTool(ScreenHandler h) {
-        // Resolve Auto to a concrete tool from the target blocks.
-        final ToolType t = toolType.get() == ToolType.Auto ? autoToolType() : toolType.get();
+        boolean primary = true;
+        for (ToolType t : restockToolTypes()) { restockOneTool(h, t, primary); primary = false; }
+    }
 
-        ItemStack held = mc.player.getMainHandStack();
-        boolean lowOrMissing = !isToolOfType(held, t)
-            || (held.getMaxDamage() - held.getDamage()) < restockDurability.get();
-        if (!lowOrMissing) return;
-        dbg("restock check: held=%s low/missing -> looking for fresh %s", held.getItem(), t);
-
-        // Match the chosen tool type specifically (by item type, so custom names/enchants
-        // don't matter) — a named axe/sword in the chest can't be grabbed by mistake.
+    /** Pull one fresh tool of type {@code t} from the open chest if we don't already hold a fresh one. */
+    private void restockOneTool(ScreenHandler h, ToolType t, boolean primary) {
+        if (hasFreshTool(t)) return;             // a fresh spare is already in reach — AutoTool will swap to it
+        dbg("restock check: no fresh %s on hand -> looking in ender chest", t);
+        // Match the tool type specifically (by item type, so custom names/enchants don't matter) — a
+        // named axe/sword in the chest can't be grabbed by mistake.
         int slot = findContainerSlot(h, s ->
             isToolOfType(s, t)
                 && (s.getMaxDamage() - s.getDamage()) >= restockDurability.get()
@@ -2131,10 +2183,27 @@ public class MassExtractor extends Module {
             else quickMove(h, slot);                     // fallback
             dbg("restocked %s into hotbar slot %d", t, free);
             info("Restocked %s.", t.name().toLowerCase());
-        } else {
+        } else if (primary) {
             dbg("no fresh %s found in ender chest", t);
             warning("No fresh %s in ender chest.", t.name().toLowerCase());
+        } else {
+            dbg("no fresh %s (secondary) in ender chest — skipping, mining continues", t);
         }
+    }
+
+    /** Tool types kept stocked from the ender chest: the main restock-tool, plus a shovel if 'also-restock-shovel' is on (deduped). */
+    private java.util.List<ToolType> restockToolTypes() {
+        ToolType primary = toolType.get() == ToolType.Auto ? autoToolType() : toolType.get();
+        java.util.List<ToolType> out = new java.util.ArrayList<>(2);
+        out.add(primary);
+        if (alsoRestockShovel.get() && primary != ToolType.Shovel) out.add(ToolType.Shovel);
+        return out;
+    }
+
+    /** True if the inventory already holds a fresh (durable, type-matched) tool of this type. */
+    private boolean hasFreshTool(ToolType t) {
+        for (int i = 0; i < 36; i++) if (isFreshTool(mc.player.getInventory().getStack(i), t)) return true;
+        return false;
     }
 
     /** True if the stack is a tool of the given type, regardless of custom name or enchants. */
@@ -2502,7 +2571,8 @@ public class MassExtractor extends Module {
         if (state == State.SELECT) return "select " + (corner1 == null ? "corner 1" : "corner 2");
         if (state == State.RESTOCK) return "restock " + restockPhase.name().toLowerCase();
         if (state == State.DEPOSIT) return "deposit " + depositPhase.name().toLowerCase();
-        if (areaLimited && state == State.MINING) return "mining " + areaChunksDone + "/" + areaChunksTotal;
+        if (areaLimited && state == State.MINING)
+            return String.format("mining y%d..%d  chunk %d/%d", curLayerBottomY(), curLayerTopY, areaChunksDone, areaChunksTotal);
         return state.name();
     }
 }

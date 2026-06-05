@@ -7,7 +7,9 @@ You point it at an area, walk away, and come back to a stack of full shulkers. I
 ## What it does
 
 - Mines a whole area, not one block at a time. It clears the ground in chunk-sized boxes and works outward, so it won't run off chasing a block on the far side of the map.
+- Mines **top-down**, always. For a set area it clears the **top layer across the whole area first**, then drops a layer and sweeps again, down to your floor — so it never tunnels one spot to bedrock while the rest sits untouched.
 - Actually collects the drops. It digs in small boxes and walks back over the ground it just cleared, so the blocks land in your inventory instead of despawning on the floor.
+- Mines gravel and sand without getting stuck on them, and (optionally) keeps a **shovel** on hand so they go fast.
 - Stores everything for you. Fills shulkers inside an ender chest, then gets back to mining.
 - Or hauls to a base (optional). Once the ender chest is full of filled shulkers, it walks to the nearest base chest (haul stays safe in the ender chest until it arrives), unloads the filled shulkers there, restocks empty shulkers from a separate supply chest, and heads back — a near-unlimited run.
 - Refuels its own tools. Grabs a fresh pickaxe when the old one wears down — either loose ones in the ender chest, or, if you turn it on, from a whole shulker of spare pickaxes kept in the chest (it places that shulker, takes a tool, and puts it back).
@@ -22,6 +24,7 @@ It runs on any Baritone, including the one bundled with Meteor. No special build
 Before you turn it on, have these on you:
 
 - A pickaxe (it mines deepslate by default), plus a few spares in the ender chest — either loose, or in a shulker if you turn on **restock-from-shulker** (lets one chest slot hold a whole shulker of pickaxes).
+- A few spare **shovels** loose in the ender chest if you're clearing gravel/sand (with **also-restock-shovel** on by default, it keeps one on hand so falling blocks go fast).
 - One or more ender chests in your inventory.
 - Empty shulker boxes inside the ender chest.
 - Optional: food for AutoEat, and totems if you're running near caves or lava.
@@ -47,6 +50,8 @@ By default it mines outward forever from where you started. If you'd rather it s
 2. Look at one corner block and press the selection key (right mouse by default).
 3. Look at the opposite corner and press it again.
 The box shows up as you aim, and mining starts as soon as both corners are set.
+
+A set area is mined in **horizontal layers, top-down**: the bot clears the top slice corner-to-corner across the whole area, then drops to the next slice, repeating to your floor. Set how thick each slice is with **layer-height** (1 = peel one block-level at a time — most even, most walking; larger = fewer full-area passes but it digs that many blocks deep at each spot first). The infinite outward spiral still clears full-height per chunk (there's no "top of an infinite area" to sweep first).
 
 When a set area is fully cleared, it packs up whatever it's still holding and stops.
 
@@ -85,15 +90,16 @@ Good to know:
 
 - It won't mine below a floor you set, so it can't dig itself into bedrock.
 - It pauses if lava ends up next to it or another player comes close.
+- It pauses to **eat**: when hunger gets low it lets go of the quarry so AutoEat can finish a bite (otherwise the mining keeps cancelling the bite and the bot loops between eating and breaking). Tune with **pause-to-eat** / **eat-below-hunger** in Safety.
 - It spaces out its actions on purpose, so it doesn't get ahead of a laggy or high-ping server and desync.
 
 ## Settings at a glance
 
 - **General** — what to mine, what to keep, the floor height, action timing, and how thoroughly it sweeps for drops (`clear-box-size` — smaller boxes pick up more; `mining-reach` — lower makes it stand closer and collect more).
-- **Area** — the area limit, the two area modes, sizes, and the corner-select key.
+- **Area** — the area limit, the two area modes, sizes, the top-down `layer-height`, and the corner-select key.
 - **Storage** — when to start packing, dropping junk and bad food, and auto-disconnect.
 - **Deposit chests** — haul filled shulkers out of the ender chest to base chests once it's full: the mode, the deposit/supply chest lists and their mark keys, empty refills (`empties-per-trip`), and travel distance cap.
-- **Tools** — which tool to restock, at what durability, and whether to pull spares from a tool-shulker in the ender chest.
-- **Safety** — lava and player pause settings.
+- **Tools** — which tool to restock, at what durability, whether to also keep a shovel on hand (`also-restock-shovel`), and whether to pull spares from a tool-shulker in the ender chest.
+- **Safety** — lava/player pause, and the eat pause (`pause-to-eat` / `eat-below-hunger`).
 - **Cave handling** — fall height and parkour/diagonal movement.
 - **Rendering** — the area box colors and style.
