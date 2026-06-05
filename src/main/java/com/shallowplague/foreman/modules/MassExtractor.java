@@ -184,7 +184,7 @@ public class MassExtractor extends Module {
 
     private final Setting<Integer> areaLayerHeight = sgArea.add(new IntSetting.Builder()
         .name("layer-height")
-        .description("Bounded areas only. Mine the area in HORIZONTAL layers this many blocks tall, top-down: the bot clears this slice across the WHOLE area (corner to corner, in clear-box-size cells) before dropping to the next slice — so it never tunnels one cell down to minY while the rest of the area stands untouched. 1 = peel one block-level at a time across the whole area (most even surface + best drop pickup, but the most repositioning/travel). Larger = fewer full-area passes (faster), but it digs this many blocks deep at each spot before moving on. Set it to your full Y band height (maxY-minY+1) for the old per-cell full-height behaviour. Unlimited areas can't pre-sweep an infinite top, so they always clear full-height per chunk.")
+        .description("Bounded areas only. Mine the area in HORIZONTAL layers this many blocks tall, top-down: the bot clears this slice across the WHOLE area (corner to corner, in clear-box-size cells) before dropping to the next slice — so it never tunnels one cell down to minY while the rest of the area stands untouched. 1 = peel one block-level at a time across the whole area (most even surface + best drop pickup, but the most repositioning/travel). At 2 or more, within each slice the bot mines the NEAREST tower of blocks top-down (this many tall) before stepping to the next column, instead of sweeping the slice in flat one-block passes — fewer full-area passes (faster), but it digs this many blocks deep at each spot before moving on. Set it to your full Y band height (maxY-minY+1) to clear each column to the floor before the next. Unlimited areas can't pre-sweep an infinite top, so they always clear full-height per chunk.")
         .defaultValue(1)
         .min(1).max(64).sliderRange(1, 32)
         .visible(limitArea::get)
@@ -927,7 +927,14 @@ public class MassExtractor extends Module {
         // is what makes descending layer-by-layer actually work. All restored on deactivate.
         pushBaritone(s, "buildinlayers", true);
         pushBaritone(s, "layerorder", true);   // true = top to bottom
-        pushBaritone(s, "layerheight", 1);     // one block per layer (full top-down sweep)
+        // Baritone's own layer thickness. A bounded run already hands clearArea ONE area-slice at a time
+        // (layer-height tall), so make that whole slice a SINGLE Baritone layer: within one layer the
+        // builder heads to the NEAREST breakable block, so (with breakFromAbove standing on top) it clears
+        // the closest TOWER of blocks top-down before stepping to the next column — instead of sweeping the
+        // slice in flat 1-block passes (layerHeight=1 would split a 2-tall slice into two horizontal sweeps).
+        // The unbounded spiral keeps 1-block layers so its full-height chunk box still descends strictly
+        // top-down a level at a time.
+        pushBaritone(s, "layerheight", limitArea.get() ? layerThickness() : 1);
         pushBaritone(s, "breakfromabove", true);
 
         // Break gravel/sand instead of thrashing on it. Stock Baritone defaults avoidUpdatingFallingBlocks
@@ -953,7 +960,8 @@ public class MassExtractor extends Module {
             dbg("pushed cave settings: maxFall=%d parkour=%b parkourPlace=%b diagDesc=%b diagAsc=%b",
                 maxFallHeight.get(), allowParkour.get(), allowParkourPlace.get(), allowDiagonalDescend.get(), allowDiagonalAscend.get());
         }
-        dbg("pushed baritone (stock): allowbreak=true topDown=true(buildInLayers+layerOrder+breakFromAbove) breakGravel=true(avoidUpdatingFallingBlocks=false,pauseForSettle=true) failTO=1000ms caveHandling=%b floorY=%d", caveHandling.get(), minYLevel.get());
+        dbg("pushed baritone (stock): allowbreak=true topDown=true(buildInLayers+layerOrder+breakFromAbove) layerHeight=%d(%s) breakGravel=true(avoidUpdatingFallingBlocks=false,pauseForSettle=true) failTO=1000ms caveHandling=%b floorY=%d",
+            limitArea.get() ? layerThickness() : 1, limitArea.get() ? "tower-first per slice" : "1-block sweeps (unbounded)", caveHandling.get(), minYLevel.get());
     }
 
     /**
