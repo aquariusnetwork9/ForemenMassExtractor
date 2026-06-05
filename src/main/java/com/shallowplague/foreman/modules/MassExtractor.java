@@ -362,6 +362,22 @@ public class MassExtractor extends Module {
         .build()
     );
 
+    private final Setting<Boolean> pauseToEat = sgSafety.add(new BoolSetting.Builder()
+        .name("pause-to-eat")
+        .description("Pause mining while hunger is low so AutoEat (or you) can finish a bite. The Baritone quarry forces the pickaxe + an attack click every tick, which CANCELS any bite mid-chew — so without this the bot loops between eating and breaking and never actually refills. While paused the quarry is released; mining resumes once you're back to full. No-op when you have no edible food (pausing couldn't help).")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Integer> eatBelowHunger = sgSafety.add(new IntSetting.Builder()
+        .name("eat-below-hunger")
+        .description("Pause to eat when food drops to this many points or below (20 = full). Set this AT OR ABOVE your AutoEat threshold so the quarry yields the moment AutoEat wants to eat (if ours is lower, the loop still happens in the gap). Mining resumes once you're full again (20).")
+        .defaultValue(18)
+        .min(1).max(19).sliderRange(1, 19)
+        .visible(pauseToEat::get)
+        .build()
+    );
+
     private final Setting<Integer> pauseRetryTicks = sgSafety.add(new IntSetting.Builder()
         .name("pause-retry-ticks")
         .description("How long to wait before re-checking after a hazard or a missing resource pause.")
@@ -569,6 +585,7 @@ public class MassExtractor extends Module {
     private int clearAreaStallTicks = 0;      // ticks the bot hasn't moved while the builder is active
     private BlockPos lastClearPos = null;     // last player pos, for stall detection
     private static final int CLEARAREA_STALL_TICKS = 20 * 30; // 30s without moving = stuck -> skip box
+    private boolean wantToEat = false;        // hunger-pause hysteresis: latched once food dips to the eat threshold, cleared when full
 
     // Sub-box subdivision (Option B): clear each chunk in clear-box-size cells so the bot repositions
     // between them and walks back over (and picks up) the drops. subBoxes holds the {x1,z1,x2,z2}
@@ -958,10 +975,10 @@ public class MassExtractor extends Module {
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null || mc.world == null) return;
 
-        // Defer to item use (eating/drinking): hold ALL MassExtractor actions while a bite is
-        // in progress, so we never restart mining mid-bite or interrupt AutoEat. (AutoEat's
-        // own "pause-baritone" setting stops Baritone; this keeps the addon out of the way
-        // too.) The timer is left frozen and resumes once the use finishes.
+        // Defer to item use (eating/drinking): hold the addon's OWN actions while a bite is in
+        // progress, so we never restart mining mid-bite. This covers the addon's storage/deposit
+        // breaks — but NOT the Baritone quarry, which runs on its own handler and keeps forcing the
+        // attack click; the hunger pause below releases the quarry so the bite can finish.
         if (mc.player.isUsingItem()) return;
 
         // CornerSelect: idle until both corners are marked (handled by the input events + render),
@@ -970,9 +987,13 @@ public class MassExtractor extends Module {
 
         if (timer > 0) { timer--; return; }
 
-        if (pauseOnHazard.get() && isHazard()) {
+        // Pause for a hazard (any state) OR for low hunger (only while MINING — the quarry is the
+        // one that fights AutoEat; pausing mid storage/deposit cycle would strand a placed chest).
+        boolean hazard = pauseOnHazard.get() && isHazard();
+        boolean hungry = hungerPauseActive() && (state == State.MINING || state == State.PAUSED);
+        if (hazard || hungry) {
             if (state != State.PAUSED) {
-                warning("Hazard detected — pausing.");
+                warning(hazard ? "Hazard detected — pausing." : "Hunger low — pausing so AutoEat can eat.");
                 stopMining();
                 state = State.PAUSED;
                 step = 0;
@@ -1304,7 +1325,9 @@ public class MassExtractor extends Module {
     // ----- PAUSED -----
 
     private void tickPaused() {
-        if (!isHazard()) {
+        boolean hazard = pauseOnHazard.get() && isHazard();
+        boolean hungry = hungerPauseActive();
+        if (!hazard && !hungry) {
             info("Clear — resuming mining.");
             resumeMining();
         } else {
@@ -2430,6 +2453,33 @@ public class MassExtractor extends Module {
         return false;
     }
 
+    /**
+     * Hunger pause: while MINING, Baritone's quarry re-selects the pickaxe and forces an attack click
+     * every tick, which cancels any bite AutoEat starts — so the bot loops eating/breaking and never
+     * refills. When food dips to the threshold we release the quarry (caller pauses) so the eat
+     * completes, and hold until we're full again (hysteresis, so we don't flap on every single bite).
+     * No-op when there's nothing edible to eat — pausing then would just stall the run.
+     */
+    private boolean hungerPauseActive() {
+        if (!pauseToEat.get()) { wantToEat = false; return false; }
+        int food = mc.player.getHungerManager().getFoodLevel();
+        if (wantToEat) {
+            if (food >= 20) wantToEat = false;                       // fully fed -> resume
+        } else if (food <= eatBelowHunger.get() && hasEdibleFood()) {
+            wantToEat = true;                                        // dipped to threshold, food on hand -> pause
+        }
+        return wantToEat;
+    }
+
+    /** True if the inventory holds any edible food (so a hunger pause can actually accomplish a refill). */
+    private boolean hasEdibleFood() {
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = mc.player.getInventory().getStack(i);
+            if (!s.isEmpty() && s.contains(DataComponentTypes.FOOD)) return true;
+        }
+        return false;
+    }
+
     private boolean isHazard() {
         // lava adjacency
         BlockPos p = mc.player.getBlockPos();
@@ -2448,6 +2498,7 @@ public class MassExtractor extends Module {
 
     @Override
     public String getInfoString() {
+        if (state == State.PAUSED && wantToEat) return "paused (eating)";
         if (state == State.SELECT) return "select " + (corner1 == null ? "corner 1" : "corner 2");
         if (state == State.RESTOCK) return "restock " + restockPhase.name().toLowerCase();
         if (state == State.DEPOSIT) return "deposit " + depositPhase.name().toLowerCase();
