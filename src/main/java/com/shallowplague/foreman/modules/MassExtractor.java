@@ -896,6 +896,16 @@ public class MassExtractor extends Module {
         pushBaritone(s, "layerheight", 1);     // one block per layer (full top-down sweep)
         pushBaritone(s, "breakfromabove", true);
 
+        // Break gravel/sand instead of thrashing on it. Stock Baritone defaults avoidUpdatingFallingBlocks
+        // = TRUE: it "will never break a block adjacent to an unsupported falling block" (to avoid cascading
+        // sand/gravel falls). In a quarry every block in/around a gravel patch is adjacent to unsupported
+        // gravel, so the builder refuses to commit and oscillates between candidate blocks forever, never
+        // completing a break (the reported "stuck switching back and forth" on gravel). We WANT to clear it,
+        // so turn that guard off. pauseMiningForFallingBlocks (held TRUE) keeps the bot patient: it breaks the
+        // gravel, waits for the cascade to settle, then continues — no thrash. Both restored on deactivate.
+        pushBaritone(s, "avoidupdatingfallingblocks", false);
+        pushBaritone(s, "pauseminingforfallingblocks", true);
+
         // Cave handling: relax fall/jump limits so the bot drops into caverns to reach blocks. Lava is
         // never walked/fallen into regardless (those moves stay cost-infinity), and we force
         // assume-walk-on-lava off so a stray config can't make it lava-walk.
@@ -909,7 +919,7 @@ public class MassExtractor extends Module {
             dbg("pushed cave settings: maxFall=%d parkour=%b parkourPlace=%b diagDesc=%b diagAsc=%b",
                 maxFallHeight.get(), allowParkour.get(), allowParkourPlace.get(), allowDiagonalDescend.get(), allowDiagonalAscend.get());
         }
-        dbg("pushed baritone (stock): allowbreak=true topDown=true(buildInLayers+layerOrder+breakFromAbove) failTO=1000ms caveHandling=%b floorY=%d", caveHandling.get(), minYLevel.get());
+        dbg("pushed baritone (stock): allowbreak=true topDown=true(buildInLayers+layerOrder+breakFromAbove) breakGravel=true(avoidUpdatingFallingBlocks=false,pauseForSettle=true) failTO=1000ms caveHandling=%b floorY=%d", caveHandling.get(), minYLevel.get());
     }
 
     /**
