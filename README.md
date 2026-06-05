@@ -8,7 +8,7 @@ You point it at an area, walk away, and come back to a stack of full shulkers. I
 
 - Mines a whole area, not one block at a time. It clears the ground in chunk-sized boxes and works outward, so it won't run off chasing a block on the far side of the map.
 - Mines **top-down**, always. For a set area it clears the **top layer across the whole area first**, then drops a layer and sweeps again, down to your floor — so it never tunnels one spot to bedrock while the rest sits untouched.
-- Actually collects the drops. It digs in small boxes and walks back over the ground it just cleared, so the blocks land in your inventory instead of despawning on the floor.
+- Actually collects the drops. It digs in small boxes and walks back over the ground it just cleared, and then does a **vacuum pass** — once a box is clear it walks over every block still lying on the floor and picks it up before moving on, so nothing is left to despawn.
 - Mines gravel and sand without getting stuck on them, and (optionally) keeps a **shovel** on hand so they go fast.
 - Stores everything for you. Fills shulkers inside an ender chest, then gets back to mining.
 - Or hauls to a base (optional). Once the ender chest is full of filled shulkers, it walks to the nearest base chest (haul stays safe in the ender chest until it arrives), unloads the filled shulkers there, restocks empty shulkers from a separate supply chest, and heads back — a near-unlimited run.
@@ -95,7 +95,7 @@ Good to know:
 
 ## Settings at a glance
 
-- **General** — what to mine, what to keep, the floor height, action timing, and how thoroughly it sweeps for drops (`clear-box-size` — smaller boxes pick up more; `mining-reach` — lower makes it stand closer and collect more).
+- **General** — what to mine, what to keep, the floor height, action timing, and how thoroughly it sweeps for drops (`clear-box-size` — smaller boxes pick up more; `mining-reach` — lower makes it stand closer and collect more; `collect-drops` — the vacuum pass after each box, with `collect-max-seconds` capping how long it lingers).
 - **Area** — the area limit, the two area modes, sizes, the top-down `layer-height`, and the corner-select key.
 - **Storage** — when to start packing, dropping junk and bad food, and auto-disconnect.
 - **Deposit chests** — haul filled shulkers out of the ender chest to base chests once it's full: the mode, the deposit/supply chest lists and their mark keys, empty refills (`empties-per-trip`), and travel distance cap.

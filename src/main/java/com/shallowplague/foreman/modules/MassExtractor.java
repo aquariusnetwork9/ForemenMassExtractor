@@ -25,6 +25,7 @@ import net.minecraft.block.Blocks;
 import net.minecraft.block.ShulkerBoxBlock;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.enchantment.Enchantments;
+import net.minecraft.entity.ItemEntity;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
@@ -37,6 +38,7 @@ import net.minecraft.text.Text;
 import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 
@@ -136,6 +138,22 @@ public class MassExtractor extends Module {
         .description("How far (in blocks) Baritone may reach to break a block — its 'blockReachDistance', default 4.5. LOWER makes the bot stand closer to each block before mining it, so when the block drops the bot is already within the ~1-block pickup range and grabs it instead of leaving it to despawn. Trades mining speed (more stepping) for collection, which is the point. Pushed only while the module is active and restored when it's turned off; re-enable the module after changing it. ~3.0 collects well; below ~2.5 the bot may struggle to reach some blocks.")
         .defaultValue(3.0)
         .min(2.0).max(4.5).sliderRange(2.0, 4.5)
+        .build()
+    );
+
+    private final Setting<Boolean> collectDrops = sgGeneral.add(new BoolSetting.Builder()
+        .name("collect-drops")
+        .description("After each sub-box is cleared, do a VACUUM pass: walk the bot over every kept item (the mined blocks in 'keep-items') still lying on the ground in that box, picking them up before moving to the next sub-box — so nothing is left to despawn. Items it can't reach in time are skipped, and the whole pass is time-capped, so it can never hang. The single biggest fix for 'blocks left lying around'.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Integer> collectMaxSeconds = sgGeneral.add(new IntSetting.Builder()
+        .name("collect-max-seconds")
+        .description("Cap on the vacuum pass per sub-box. If it's still chasing drops after this many seconds (some landed somewhere unreachable), it gives up on the rest and moves on, so a few stuck items can't stall the run. Raise it if your sub-boxes are large and drops get left; lower it if you'd rather keep mining and not linger.")
+        .defaultValue(20)
+        .min(2).max(120).sliderRange(5, 60)
+        .visible(collectDrops::get)
         .build()
     );
 
@@ -506,6 +524,7 @@ public class MassExtractor extends Module {
     private enum State {
         SELECT,            // CornerSelect mode: waiting for the player to mark two corners
         MINING,            // Baritone is mining target blocks
+        COLLECT,           // vacuum pass: walk over the just-cleared sub-box's drops before the next box
         CLEAR_AREA,        // mine a small pocket so the echest + shulker both have room
         PLACE_ECHEST,      // place the ender chest (multi-step)
         ECHEST_TAKE,       // open echest, restock pickaxe, pull an empty shulker (multi-step)
@@ -602,6 +621,15 @@ public class MassExtractor extends Module {
     private BlockPos lastClearPos = null;     // last player pos, for stall detection
     private static final int CLEARAREA_STALL_TICKS = 20 * 30; // 30s without moving = stuck -> skip box
     private boolean wantToEat = false;        // hunger-pause hysteresis: latched once food dips to the eat threshold, cleared when full
+
+    // Drop-collection (State.COLLECT): after a sub-box clears, walk over its dropped kept-items.
+    private int[] collectBounds = null;       // {x1,z1,x2,z2} of the sub-box being vacuumed (snapshot)
+    private boolean collectStalled = false;   // carry the sub-box's stalled flag through to afterSubBox
+    private ItemEntity collectTarget = null;  // the drop we're currently walking to
+    private int collectTargetTicks = 0;       // ticks spent reaching the current drop (per-item give-up watch)
+    private int collectTotalTicks = 0;        // ticks spent on this whole sub-box's vacuum (overall cap)
+    private final java.util.Set<Integer> collectSkip = new java.util.HashSet<>(); // drops we gave up reaching
+    private static final int COLLECT_ITEM_TICKS = 20 * 8; // 8s to reach one drop, else skip it
 
     // Sub-box subdivision (Option B): clear each chunk in clear-box-size cells so the bot repositions
     // between them and walks back over (and picks up) the drops. subBoxes holds the {x1,z1,x2,z2}
@@ -1029,6 +1057,7 @@ public class MassExtractor extends Module {
 
         switch (state) {
             case MINING       -> tickMining();
+            case COLLECT      -> tickCollect();
             case CLEAR_AREA   -> tickClearArea();
             case PLACE_ECHEST -> tickPlaceEchest();
             case ECHEST_TAKE  -> tickEchestTake();
@@ -1913,7 +1942,7 @@ public class MassExtractor extends Module {
     private void tickClearAreaMining() {
         if (!baritone.getBuilderProcess().isActive()) {
             if (clearAreaStarted) {
-                afterSubBox(false);           // sub-box cleared; next sub-box, or finish the chunk
+                beginCollect(false);          // sub-box cleared; vacuum its drops, then next sub-box / chunk
             } else {
                 startClearArea();             // very first chunk of the run
                 timer = nextDelay();
@@ -1947,6 +1976,89 @@ public class MassExtractor extends Module {
         } else {
             afterChunk(stalled);
         }
+    }
+
+    // ----- COLLECT: vacuum the just-cleared sub-box's drops before moving on -----
+
+    /**
+     * A sub-box just cleared. If drop-collection is on and there's a kept item lying in it (and room to
+     * hold more), enter the COLLECT state to walk over them; otherwise advance straight away. The
+     * sub-box's XZ footprint is snapshotted so the bounds stay correct even though subBoxIdx hasn't moved.
+     */
+    private void beginCollect(boolean stalled) {
+        if (!collectDrops.get() || !canHoldMoreTarget()) { afterSubBox(stalled); return; }
+        int[] b = subBoxes.get(subBoxIdx);
+        collectBounds = new int[]{ b[0], b[1], b[2], b[3] };
+        collectStalled = stalled;
+        collectTarget = null;
+        collectTargetTicks = 0;
+        collectTotalTicks = 0;
+        collectSkip.clear();
+        if (nearestCollectable() == null) { afterSubBox(stalled); return; } // nothing dropped here
+        baritone.getBuilderProcess().onLostControl();    // builder's done with this box; release it
+        dbg("collect: vacuuming drops in sub-box x[%d..%d] z[%d..%d]", b[0], b[2], b[1], b[3]);
+        go(State.COLLECT);
+        timer = nextDelay();
+    }
+
+    private void tickCollect() {
+        // No room to pick anything up -> stop; the next mining tick fires the storage cycle.
+        if (!canHoldMoreTarget()) { dbg("collect: inventory full — done"); finishCollect(); return; }
+        // Overall cap: a few drops landed somewhere unreachable; don't linger forever.
+        if (++collectTotalTicks > collectMaxSeconds.get() * 20) {
+            dbg("collect: hit %ds cap — moving on", collectMaxSeconds.get());
+            finishCollect();
+            return;
+        }
+        // Still walking to a live drop we haven't reached yet?
+        if (collectTarget != null && collectTarget.isAlive() && !collectTarget.isRemoved()) {
+            if (++collectTargetTicks > COLLECT_ITEM_TICKS) {
+                dbg("collect: gave up on drop %d (unreachable)", collectTarget.getId());
+                collectSkip.add(collectTarget.getId());
+                collectTarget = null;                    // fall through and pick another
+            } else {
+                return;                                  // goal already set — keep heading to it
+            }
+        } else {
+            collectTarget = null;                        // picked up / despawned
+        }
+        // Pick the nearest remaining drop and path to it.
+        ItemEntity next = nearestCollectable();
+        if (next == null) { dbg("collect: all drops grabbed"); finishCollect(); return; }
+        collectTarget = next;
+        collectTargetTicks = 0;
+        pathToNear(next.getBlockPos(), 1);               // walk within ~1 block so vanilla pickup grabs it
+        timer = nextDelay();
+    }
+
+    /** Nearest kept-item drop still on the ground in (or just around) the sub-box we're vacuuming. */
+    private ItemEntity nearestCollectable() {
+        if (collectBounds == null) return null;
+        ItemEntity best = null;
+        double bestSq = Double.MAX_VALUE;
+        for (ItemEntity e : mc.world.getEntitiesByClass(ItemEntity.class, collectArea(),
+                e -> e.isAlive() && !collectSkip.contains(e.getId()) && isTargetStack(e.getStack()))) {
+            double d = e.squaredDistanceTo(mc.player);
+            if (d < bestSq) { bestSq = d; best = e; }
+        }
+        return best;
+    }
+
+    /** The sub-box XZ footprint (with a small margin) over the active Y band — where drops can rest. */
+    private Box collectArea() {
+        int yLo = (areaLimited ? curLayerBottomY() : minYLevel.get()) - 2;
+        int yHi = (areaLimited ? curLayerTopY : quarryTopY) + 2;
+        return new Box(collectBounds[0] - 2, yLo, collectBounds[1] - 2,
+                       collectBounds[2] + 3, yHi, collectBounds[3] + 3);
+    }
+
+    /** Done vacuuming this sub-box: drop the walk goal and advance the quarry. */
+    private void finishCollect() {
+        baritone.getCustomGoalProcess().onLostControl();  // stop walking to drops
+        collectTarget = null;
+        collectBounds = null;
+        go(State.MINING);                                 // afterSubBox issues the next box; MINING drives it
+        afterSubBox(collectStalled);
     }
 
     /**
@@ -2576,6 +2688,7 @@ public class MassExtractor extends Module {
     @Override
     public String getInfoString() {
         if (state == State.PAUSED && wantToEat) return "paused (eating)";
+        if (state == State.COLLECT) return "collecting drops";
         if (state == State.SELECT) return "select " + (corner1 == null ? "corner 1" : "corner 2");
         if (state == State.RESTOCK) return "restock " + restockPhase.name().toLowerCase();
         if (state == State.DEPOSIT) return "deposit " + depositPhase.name().toLowerCase();
