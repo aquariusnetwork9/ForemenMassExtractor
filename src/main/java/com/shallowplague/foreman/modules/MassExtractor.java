@@ -630,10 +630,13 @@ public class MassExtractor extends Module {
     private int[] collectBounds = null;       // {x1,z1,x2,z2} of the sub-box being vacuumed (snapshot)
     private boolean collectStalled = false;   // carry the sub-box's stalled flag through to afterSubBox
     private ItemEntity collectTarget = null;  // the drop we're currently walking to
+    private boolean collectPathed = false;    // have we issued the path to collectTarget yet (false = still letting it settle)
+    private int collectSettleTicks = 0;       // ticks waited for the current drop to settle on the ground
     private int collectTargetTicks = 0;       // ticks spent reaching the current drop (per-item give-up watch)
     private int collectTotalTicks = 0;        // ticks spent on this whole sub-box's vacuum (overall cap)
     private final java.util.Set<Integer> collectSkip = new java.util.HashSet<>(); // drops we gave up reaching
-    private static final int COLLECT_ITEM_TICKS = 20 * 8; // 8s to reach one drop, else skip it
+    private static final int COLLECT_ITEM_TICKS = 20 * 3;   // 3s to reach one drop, else skip it
+    private static final int COLLECT_SETTLE_TICKS = 20;     // wait up to 1s for a fresh drop to settle before chasing it
 
     // Sub-box subdivision (Option B): clear each chunk in clear-box-size cells so the bot repositions
     // between them and walks back over (and picks up) the drops. subBoxes holds the {x1,z1,x2,z2}
@@ -2108,6 +2111,8 @@ public class MassExtractor extends Module {
         collectBounds = new int[]{ b[0], b[1], b[2], b[3] };
         collectStalled = stalled;
         collectTarget = null;
+        collectPathed = false;
+        collectSettleTicks = 0;
         collectTargetTicks = 0;
         collectTotalTicks = 0;
         collectSkip.clear();
@@ -2127,24 +2132,37 @@ public class MassExtractor extends Module {
             finishCollect();
             return;
         }
-        // Still walking to a live drop we haven't reached yet?
+        // Working a live drop?
         if (collectTarget != null && collectTarget.isAlive() && !collectTarget.isRemoved()) {
+            if (!collectPathed) {
+                // Settle delay: let a freshly-dropped item come to rest before chasing it, so the bot
+                // doesn't path to a stale block while it's still bouncing/rolling. Path once it's on the
+                // ground (or the settle window elapses), reading its CURRENT block so we go to where it
+                // actually landed.
+                if (!collectTarget.isOnGround() && ++collectSettleTicks < COLLECT_SETTLE_TICKS) return;
+                pathToBlock(collectTarget.getBlockPos()); // stand ON the drop (2b won't always grab from a block away)
+                collectPathed = true;
+                collectTargetTicks = 0;
+                timer = nextDelay();
+                return;
+            }
             if (++collectTargetTicks > COLLECT_ITEM_TICKS) {
                 dbg("collect: gave up on drop %d (unreachable)", collectTarget.getId());
                 collectSkip.add(collectTarget.getId());
                 collectTarget = null;                    // fall through and pick another
             } else {
-                return;                                  // goal already set — keep heading to it
+                return;                                  // heading to it
             }
         } else {
             collectTarget = null;                        // picked up / despawned
         }
-        // Pick the nearest remaining drop and path to it.
+        // Pick the nearest remaining drop; the settle branch above paths to it on the next tick.
         ItemEntity next = nearestCollectable();
         if (next == null) { dbg("collect: all drops grabbed"); finishCollect(); return; }
         collectTarget = next;
+        collectPathed = false;
+        collectSettleTicks = 0;
         collectTargetTicks = 0;
-        pathToBlock(next.getBlockPos());                 // stand ON the drop (2b won't always grab from a block away)
         timer = nextDelay();
     }
 
