@@ -2252,10 +2252,10 @@ public class MassExtractor extends Module {
 
     private enum Pickup { BUSY, DONE, GAVE_UP }
 
-    /** Reset the shared pickup tracker before a break, snapshotting how many matching shulkers we hold. */
+    /** Reset the shared pickup tracker before a break, snapshotting how many matching items we hold. */
     private void beginPickup(java.util.function.Predicate<ItemStack> match) {
         pickupDrop = null; pickupPathed = false; pickupSettleTicks = 0; pickupGoal = null; pickupAttempts = 0;
-        pickupBefore = countShulkers(match);
+        pickupBefore = countItemsMatching(match); // ITEM count, not slots — a recovered echest re-stacks
     }
 
     /**
@@ -2266,7 +2266,7 @@ public class MassExtractor extends Module {
      * shulker that bounced a block off the break spot is still walked onto.
      */
     private Pickup tickPickupDrop(BlockPos breakPos, java.util.function.Predicate<ItemStack> match) {
-        if (countShulkers(match) > pickupBefore) {
+        if (countItemsMatching(match) > pickupBefore) {
             if (baritone != null) baritone.getPathingBehavior().cancelEverything(); // stop the nudge walk
             pickupDrop = null; pickupGoal = null;
             return Pickup.DONE;
@@ -2509,6 +2509,21 @@ public class MassExtractor extends Module {
     private int countShulkers(java.util.function.Predicate<ItemStack> p) {
         int n = 0;
         for (int i = 0; i < 36; i++) if (p.test(mc.player.getInventory().getStack(i))) n++;
+        return n;
+    }
+
+    /**
+     * Total ITEM COUNT (summed stack sizes), not slot count, of inventory stacks matching p. The shared
+     * pickup success check must use this: a recovered ender chest re-stacks into an existing echest slot,
+     * so the slot count (countShulkers) wouldn't change and the pickup would never register as done. (For
+     * non-stackable drops like filled/tool shulkers this equals the slot count, so it's safe everywhere.)
+     */
+    private int countItemsMatching(java.util.function.Predicate<ItemStack> p) {
+        int n = 0;
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = mc.player.getInventory().getStack(i);
+            if (p.test(s)) n += s.getCount();
+        }
         return n;
     }
     private boolean isEmptyShulkerInInv(ItemStack s)  { return isEmptyShulkerStack(s); }
