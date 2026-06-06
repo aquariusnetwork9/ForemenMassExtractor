@@ -622,7 +622,8 @@ public class MassExtractor extends Module {
     private boolean clearAreaStarted = false; // have we issued clearArea for the current chunk yet
     private int clearAreaStallTicks = 0;      // ticks the bot hasn't moved while the builder is active
     private BlockPos lastClearPos = null;     // last player pos, for stall detection
-    private static final int CLEARAREA_STALL_TICKS = 20 * 30; // 30s without moving = stuck -> skip box
+    private static final int CLEARAREA_STALL_TICKS = 20 * 10; // 10s without moving while mining = stuck -> skip box
+    private static final int TRAVEL_STALL_TICKS = 20 * 30;    // 30s without moving en route to a base chest = give up
     private boolean wantToEat = false;        // hunger-pause hysteresis: latched once food dips to the eat threshold, cleared when full
 
     // Drop-collection (State.COLLECT): after a sub-box clears, walk over its dropped kept-items.
@@ -1131,9 +1132,11 @@ public class MassExtractor extends Module {
     // ----- CLEAR_AREA: open a pocket so the echest + shulker both have somewhere to go -----
 
     private void tickClearArea() {
-        // Before placing anything, make sure the hotbar has a free slot to stage the echest and
-        // shulker — evict any target blocks the hotbar picked up during mining into main inv.
-        if (sweepHotbarTargets()) { timer = nextDelay(); return; }
+        // Before placing anything, make sure the hotbar has a free slot to stage the echest and shulker.
+        // Evict a target the hotbar picked up during mining into the main inventory; if the main inventory
+        // is full too, drop one (re-collected next cycle) — otherwise a hotbar full of target blocks (common
+        // with 2+ keep-items) leaves no slot to stage the echest and the storage cycle fails.
+        if (freeHotbarSlot() == -1 && freeHotbarForStaging()) { timer = nextDelay(); return; }
 
         BlockPos feet = mc.player.getBlockPos();
         // Break the four horizontal neighbours at feet + head height, leaving the floor
@@ -1197,6 +1200,8 @@ public class MassExtractor extends Module {
                 int shulkerSlot = findContainerSlot(h, this::isEmptyShulker);
                 if (shulkerSlot >= 0) {
                     int free = freeHotbarSlot();
+                    if (free == -1 && dropOneHotbarTarget()) { timer = nextDelay(); return; } // free a hotbar slot, retry
+                    free = freeHotbarSlot();
                     if (free != -1) swapToHotbar(h, shulkerSlot, free); // one packet, lands in hotbar
                     else quickMove(h, shulkerSlot);                     // fallback: at least pull it out
                     dbg("pulled empty shulker to hotbar slot %d", free);
@@ -1616,8 +1621,8 @@ public class MassExtractor extends Module {
         }
         BlockPos p = mc.player.getBlockPos();
         if (lastTravelPos == null || !p.equals(lastTravelPos)) { lastTravelPos = p; depositTravelTicks = 0; }
-        else if (++depositTravelTicks > CLEARAREA_STALL_TICKS) {
-            warning("Couldn't reach the %s chest (no movement %ds) — trying another.", supplyLeg ? "supply" : "deposit", CLEARAREA_STALL_TICKS / 20);
+        else if (++depositTravelTicks > TRAVEL_STALL_TICKS) {
+            warning("Couldn't reach the %s chest (no movement %ds) — trying another.", supplyLeg ? "supply" : "deposit", TRAVEL_STALL_TICKS / 20);
             baritone.getPathingBehavior().cancelEverything();
             tryNextChest(supplyLeg);
         }
@@ -1721,6 +1726,23 @@ public class MassExtractor extends Module {
         }
     }
 
+    /**
+     * Path the bot to stand ON {@code pos} (Baritone's GoalBlock — exact block, not "near"). Used to
+     * vacuum drops: the bot walks right onto/through the item's block so vanilla pickup fires even when
+     * 2b's pickup physics won't grab it from a block away. Reflective for the same reason as pathToNear.
+     */
+    private boolean pathToBlock(BlockPos pos) {
+        try {
+            Class<?> goalBlock = Class.forName("baritone.api.pathing.goals.GoalBlock");
+            Object goal = goalBlock.getConstructor(BlockPos.class).newInstance(pos);
+            baritone.getCustomGoalProcess().setGoalAndPath((baritone.api.pathing.goals.Goal) goal);
+            return true;
+        } catch (Exception e) {
+            dbg("pathToBlock reflection failed: %s", e.toString());
+            return false;
+        }
+    }
+
     // ---------------- Placement sub-routine (3 ticks: select, place, swapBack) ----------------
 
     /**
@@ -1743,8 +1765,8 @@ public class MassExtractor extends Module {
                 FindItemResult any = InvUtils.find(pred);
                 if (!any.found()) return Place.FAILED;            // lost the item
                 int free = freeHotbarSlot();
-                if (free == -1) {                                 // hotbar full — try to free a slot
-                    if (sweepHotbarTargets()) { timer = nextDelay(); return Place.BUSY; } // evicted a target, retry
+                if (free == -1) {                                 // hotbar full — free a slot
+                    if (freeHotbarForStaging()) { timer = nextDelay(); return Place.BUSY; } // moved or dropped a target, retry
                     return Place.FAILED;                          // genuinely no room (all tools/echest/food)
                 }
                 InvUtils.move().from(any.slot()).toHotbar(free);  // main -> hotbar
@@ -2122,7 +2144,7 @@ public class MassExtractor extends Module {
         if (next == null) { dbg("collect: all drops grabbed"); finishCollect(); return; }
         collectTarget = next;
         collectTargetTicks = 0;
-        pathToNear(next.getBlockPos(), 1);               // walk within ~1 block so vanilla pickup grabs it
+        pathToBlock(next.getBlockPos());                 // stand ON the drop (2b won't always grab from a block away)
         timer = nextDelay();
     }
 
@@ -2724,6 +2746,39 @@ public class MassExtractor extends Module {
             return true;
         }
         return false;
+    }
+
+    /**
+     * Throw ONE target stack out of the hotbar to free a staging slot, when the main inventory is full so
+     * it can't be relocated. The dropped blocks land on the ground and are re-collected on the next mining
+     * cycle (the user's accepted trade). Works whether or not a container is open — in an open container the
+     * player's hotbar is the last 9 of the trailing 36 slots; in the player's own screen it's slots 36..44.
+     * Returns true if it dropped one.
+     */
+    private boolean dropOneHotbarTarget() {
+        var inv = mc.player.getInventory();
+        for (int i = 0; i <= 8; i++) {
+            if (!isTargetStack(inv.getStack(i))) continue;
+            ScreenHandler h;
+            int screenSlot;
+            if (isContainerOpen()) { h = mc.player.currentScreenHandler; screenSlot = h.slots.size() - 9 + i; }
+            else                   { h = mc.player.playerScreenHandler;   screenSlot = 36 + i; }
+            mc.interactionManager.clickSlot(h.syncId, screenSlot, 1, SlotActionType.THROW, mc.player); // button 1 = whole stack
+            dbg("dropped hotbar target (hotbar slot %d) to free a staging slot — re-collected next mining cycle", i);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Make sure the hotbar can stage the echest/shulker: relocate a hotbar target into the main inventory
+     * (preferred), or — when the main inventory is full too — drop one. Returns true if it freed (or is
+     * freeing) a slot this tick; the caller should wait a tick and retry. Caller must have NO container
+     * open (it may use {@link #sweepHotbarTargets}); {@link #dropOneHotbarTarget} handles the open case.
+     */
+    private boolean freeHotbarForStaging() {
+        if (sweepHotbarTargets()) return true;   // moved one into the main inventory
+        return dropOneHotbarTarget();            // main full -> drop one (re-collected next cycle)
     }
 
     /** True if the main inventory (slots 9-35) has an empty slot or a non-full stack matching {@code s}. */
