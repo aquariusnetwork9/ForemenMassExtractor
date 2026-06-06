@@ -682,7 +682,8 @@ public class MassExtractor extends Module {
     private BlockPos pickupGoal = null;       // block we last pathed to (re-path when the drop drifts)
     private int pickupAttempts = 0;           // overall ticks spent waiting (give-up cap)
     private int pickupBefore = 0;             // matching shulkers in inv before the break (success = it rose)
-    private boolean pickupSnapshotTaken = false; // loot cycle: snapshotted the pre-break count once already
+    private boolean pickupSnapshotTaken = false; // a break is in progress: the pre-break count is snapshotted
+    private int pickupBreakTicks = 0;         // ticks spent swinging at the block (ghost-block break cap)
 
     // Deposit-chest trip (State.DEPOSIT). 'depositActive' = the bot uses fixed deposit/supply chests at a
     // base (any deposit-target other than EnderChest). The ender chest stays the FIELD buffer (filled
@@ -1388,12 +1389,7 @@ public class MassExtractor extends Module {
     // ----- BREAK_ECHEST -----
 
     private void tickBreakEchest() {
-        if (placedEchest != null
-                && mc.world.getBlockState(placedEchest).getBlock() == Blocks.ENDER_CHEST) {
-            BlockUtils.breakBlock(placedEchest, true); // continuous until it pops
-            return; // breaking must run every tick to make progress — no action-delay here
-        }
-        placedEchest = null;
+        if (!breakAndCollectEchest()) return; // break + chase the ender chest drop before resuming
         resumeMining();
         timer = nextDelay();
     }
@@ -1546,11 +1542,7 @@ public class MassExtractor extends Module {
     private void tickPullClose() { closeScreen(); setDepositPhase(DepositPhase.PULL_BREAK); timer = nextDelay(); }
 
     private void tickPullBreak() {
-        if (placedEchest != null && mc.world.getBlockState(placedEchest).getBlock() == Blocks.ENDER_CHEST) {
-            BlockUtils.breakBlock(placedEchest, true); // continuous until it pops
-            return;
-        }
-        placedEchest = null;
+        if (!breakAndCollectEchest()) return; // break + chase the ender chest drop before dumping
         tripExtracted = true;
         if (countShulkers(this::isLootFilledShulker) > 0) {
             setDepositPhase(DepositPhase.OPEN_DEPOSIT);  // open the deposit chest and dump them
@@ -1592,11 +1584,7 @@ public class MassExtractor extends Module {
     private void tickStockClose() { closeScreen(); setDepositPhase(DepositPhase.STOCK_BREAK); timer = nextDelay(); }
 
     private void tickStockBreak() {
-        if (placedEchest != null && mc.world.getBlockState(placedEchest).getBlock() == Blocks.ENDER_CHEST) {
-            BlockUtils.breakBlock(placedEchest, true); // continuous until it pops
-            return;
-        }
-        placedEchest = null;
+        if (!breakAndCollectEchest()) return; // break + chase the ender chest drop before finishing the trip
         setDepositPhase(DepositPhase.DONE);
         timer = nextDelay();
     }
@@ -1873,6 +1861,10 @@ public class MassExtractor extends Module {
             baritone.getBuilderProcess().onLostControl(); // cancel any active clearArea quarry
             baritone.getPathingBehavior().cancelEverything();
         }
+        // A pause (hazard/hunger/explicit) can preempt a break mid-swing and the cycle resumes from MINING,
+        // so clear the break/pickup tracker — the next cycle's break must re-snapshot, not reuse a stale one.
+        pickupSnapshotTaken = false;
+        pickupBreakTicks = 0;
     }
 
     // ----- Outward chunk spiral -----
@@ -2245,8 +2237,8 @@ public class MassExtractor extends Module {
         return best;
     }
 
-    /** Nearest dropped shulker item (matching p) within a few blocks of where we just broke it (it can bounce off). */
-    private ItemEntity nearestDroppedShulker(BlockPos near, java.util.function.Predicate<ItemStack> p) {
+    /** Nearest dropped item (matching p) within a few blocks of where we just broke it (it can bounce off). */
+    private ItemEntity nearestDrop(BlockPos near, java.util.function.Predicate<ItemStack> p) {
         if (near == null || mc.world == null) return null;
         ItemEntity best = null;
         double bestSq = Double.MAX_VALUE;
@@ -2286,7 +2278,7 @@ public class MassExtractor extends Module {
         }
         // (Re)acquire the dropped shulker item — it can pop a block off the break spot.
         if (pickupDrop == null || !pickupDrop.isAlive() || pickupDrop.isRemoved()) {
-            pickupDrop = nearestDroppedShulker(breakPos, match);
+            pickupDrop = nearestDrop(breakPos, match);
             pickupPathed = false; pickupSettleTicks = 0; pickupGoal = null;
         }
         if (pickupDrop != null) {
@@ -2304,6 +2296,36 @@ public class MassExtractor extends Module {
             pathToBlock(breakPos); pickupPathed = true; // no entity in range yet — walk to the break spot
         }
         return Pickup.BUSY;
+    }
+
+    private boolean isEnderChest(ItemStack s) { return s.getItem() == Items.ENDER_CHEST; }
+
+    /**
+     * Shared "break the placed ender chest, then collect its drop" step, used by every echest-break site
+     * (storage recover, deposit extract/stock, restock recover). On 2b a broken block can fly up to ~2
+     * blocks, lag delays settling, and ghost blocks happen — so this breaks the chest (with a ghost-block
+     * cap so a stale client block can't spin forever), then chases the dropped ender chest onto the bot
+     * before reporting done. Returns {@code false} while still breaking/chasing (the caller should return
+     * and tick again — timing is handled here), {@code true} once collected (or the ~10s give-up elapsed).
+     * Clears {@code placedEchest} on completion.
+     */
+    private boolean breakAndCollectEchest() {
+        if (placedEchest != null && mc.world.getBlockState(placedEchest).getBlock() == Blocks.ENDER_CHEST) {
+            if (!pickupSnapshotTaken) { beginPickup(this::isEnderChest); pickupSnapshotTaken = true; pickupBreakTicks = 0; }
+            if (++pickupBreakTicks <= 20 * 10) {                 // still swinging (cap ~10s for ghost blocks)
+                BlockUtils.breakBlock(placedEchest, true);       // continuous until it pops — runs every tick
+                return false;
+            }
+            dbg("echest break: block still reads as ender chest after 10s — treating as ghost, moving to pickup");
+        }
+        if (pickupSnapshotTaken) { // we placed/broke a chest this visit — chase the drop before proceeding
+            Pickup r = tickPickupDrop(placedEchest, this::isEnderChest);
+            if (r == Pickup.BUSY) { timer = nextDelay(); return false; }
+            if (r == Pickup.GAVE_UP) dbg("echest pickup: gave up chasing the ender chest drop — proceeding");
+            pickupSnapshotTaken = false;
+        }
+        placedEchest = null;
+        return true;
     }
 
     /** The sub-box XZ footprint (with a small margin) over the active Y band — where drops can rest. */
@@ -2718,10 +2740,11 @@ public class MassExtractor extends Module {
             case CLOSE_SHULKER -> { closeScreen(); setRestockPhase(RestockPhase.BREAK_SHULKER); timer = nextDelay(); }
             case BREAK_SHULKER -> {
                 if (placedShulker != null && mc.world.getBlockState(placedShulker).getBlock() instanceof ShulkerBoxBlock) {
+                    if (!pickupSnapshotTaken) { beginPickup(this::isToolBearingShulker); pickupSnapshotTaken = true; } // snapshot BEFORE it pops
                     BlockUtils.breakBlock(placedShulker, true); // continuous until it pops (drops with its remaining + stowed tools)
                     return; // breaking must run every tick — no action-delay here
                 }
-                beginPickup(this::isToolBearingShulker);      // snapshot, then chase the drop before reopening
+                pickupSnapshotTaken = false;                  // chase the drop before reopening
                 setRestockPhase(RestockPhase.PICKUP_SHULKER);
                 timer = nextDelay();
             }
@@ -2764,11 +2787,7 @@ public class MassExtractor extends Module {
             }
             case CLOSE_ECHEST2 -> { closeScreen(); setRestockPhase(RestockPhase.BREAK_ECHEST); timer = nextDelay(); }
             case BREAK_ECHEST -> {
-                if (placedEchest != null && mc.world.getBlockState(placedEchest).getBlock() == Blocks.ENDER_CHEST) {
-                    BlockUtils.breakBlock(placedEchest, true); // continuous until it pops
-                    return; // breaking must run every tick — no action-delay here
-                }
-                placedEchest = null;
+                if (!breakAndCollectEchest()) return; // break + chase the ender chest drop before finishing
                 setRestockPhase(RestockPhase.DONE);
                 timer = nextDelay();
             }
