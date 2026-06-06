@@ -415,6 +415,31 @@ public class MassExtractor extends Module {
         .build()
     );
 
+    private final Setting<Boolean> restockFood = sgSafety.add(new BoolSetting.Builder()
+        .name("restock-food")
+        .description("When you run out of food, crack a FOOD-SHULKER kept in your ender chest and refill — its OWN cycle, independent of the loot-storage and tool-restock cycles. Place the echest, take the food-shulker, place + open it, grab food (preferring golden carrot → enchanted golden apple → golden apple → cooked meat/bread → any other edible), then break the shulker, put it back, and recover the echest. Fires the moment good food on hand drops below 'min-food-on-hand' (1 = the last bite was eaten) — on food COUNT, not hunger, so fresh food is staged BEFORE you ever get hungry. The food-shulker is matched by its CONTENTS (a shulker holding edible, non-risky food), so it needs no special name/colour and your loot shulkers are never touched. Every break/pickup uses the same settle → chase → confirm handling as the rest of the addon, so a lag spike or desync can't lose the shulker. Best-effort: if no food-shulker (or no edible food) is found it warns and keeps mining rather than stalling. Keep a shulker of food in your ender chest. Off = rely on the food you start with.")
+        .defaultValue(false)
+        .build()
+    );
+
+    private final Setting<Integer> minFoodOnHand = sgSafety.add(new IntSetting.Builder()
+        .name("min-food-on-hand")
+        .description("Start a food restock when the number of good (non-risky) food items in the inventory drops BELOW this. 1 (default) = refill the instant the last piece of food is eaten. Higher keeps a bigger buffer on hand. The trigger is purely on food COUNT, not hunger, so the refill happens before the hunger pause ever kicks in.")
+        .defaultValue(1)
+        .min(1).max(64).sliderRange(1, 32)
+        .visible(restockFood::get)
+        .build()
+    );
+
+    private final Setting<Integer> foodRestockCount = sgSafety.add(new IntSetting.Builder()
+        .name("food-restock-count")
+        .description("How much food to pull from the food-shulker each refill — the bot tops up to this many good-food items (whole stacks, in the preference order). 64 = a full stack (e.g. of golden carrots), plenty for a long stretch. Always clamped up to at least 'min-food-on-hand', so a refill can never leave you still under the trigger.")
+        .defaultValue(64)
+        .min(1).max(1024).sliderRange(16, 256)
+        .visible(restockFood::get)
+        .build()
+    );
+
     private final Setting<Integer> pauseRetryTicks = sgSafety.add(new IntSetting.Builder()
         .name("pause-retry-ticks")
         .description("How long to wait before re-checking after a hazard or a missing resource pause.")
@@ -538,6 +563,7 @@ public class MassExtractor extends Module {
         ECHEST_STORE,      // reopen echest, store the filled shulker one per tick (multi-step)
         BREAK_ECHEST,      // break the echest to pick it back up
         RESTOCK,           // tool-shulker restock cycle (driven by an inner RestockPhase FSM)
+        FOOD_RESTOCK,      // food-shulker restock cycle (driven by an inner FoodPhase FSM)
         DEPOSIT,           // travel to a marked chest, deposit filled shulkers, refill empties (DepositPhase FSM)
         PAUSED,            // hazard / waiting
         DONE               // ender chest full of filled shulkers
@@ -569,6 +595,32 @@ public class MassExtractor extends Module {
         CLOSE_ECHEST2,  // close the chest
         BREAK_ECHEST,   // break + collect the ender chest
         DONE            // resume mining (or pause, if the cycle aborted)
+    }
+
+    /**
+     * Sub-phases of the food-shulker restock cycle (the {@link State#FOOD_RESTOCK} state). Mirrors the
+     * tool-shulker cycle: crack a food-shulker kept in the ender chest, take food (by preference order),
+     * put the shulker back, recover the echest. place echest → open → take food-shulker → close → place
+     * shulker → open → take food → close → break shulker → reopen echest → return shulker → close → break
+     * echest → done. Every world/container action is one packet on its own tick + action-delay, and the
+     * break/pickup uses the shared settle → chase → confirm tracker, exactly like the tool cycle.
+     */
+    private enum FoodPhase {
+        PLACE_ECHEST,   // place the ender chest
+        OPEN_ECHEST,    // open it
+        TAKE_SHULKER,   // pull the food-shulker into the hotbar
+        CLOSE_ECHEST,   // close the chest
+        PLACE_SHULKER,  // place the food-shulker
+        OPEN_SHULKER,   // open it
+        TAKE_FOOD,      // grab food (by preference order) up to the restock count
+        CLOSE_SHULKER,  // close it
+        BREAK_SHULKER,  // break the food-shulker (drops with its remaining food)
+        PICKUP_SHULKER, // wait until the dropped food-shulker is collected
+        REOPEN_ECHEST,  // reopen the ender chest
+        RETURN_SHULKER, // put the food-shulker back in the chest
+        CLOSE_ECHEST2,  // close the chest
+        BREAK_ECHEST,   // break + collect the ender chest
+        DONE            // resume mining
     }
 
     /** Which tool the restock pulls. Auto = derive from the target blocks' mineable tag. */
@@ -672,6 +724,22 @@ public class MassExtractor extends Module {
     private int restockReturnedBefore = -1;   // RETURN_SHULKER: tool-shulkers in the echest before the store (confirm it lands)
     private int echestStoredBefore = -1;      // ECHEST_STORE: filled shulkers in the echest before the store (confirm it lands)
 
+    // Food-shulker restock cycle (State.FOOD_RESTOCK). 'foodRestocking' routes the shared CLEAR_AREA
+    // pocket-prep into the food FSM; 'foodPhase' is the current sub-phase. It's best-effort: if no
+    // food-shulker (or no edible food) is found, the cycle still recovers the echest, warns, and latches
+    // 'foodRestockExhausted' so it doesn't thrash the echest re-trying — mining just continues (running low
+    // on food, unlike a broken tool, never stalls the run; the latch clears on re-activate). 'foodTookAny'
+    // records whether any food was actually pulled, 'foodShulkerEmptied' that the shulker was emptied of
+    // food (so the now-empty shulker stays recognisable for pickup/return), and 'foodReturnedBefore'
+    // confirms the return store landed.
+    private boolean foodRestocking = false;
+    private FoodPhase foodPhase = FoodPhase.PLACE_ECHEST;
+    private String foodRestockAbort = null;
+    private boolean foodTookAny = false;
+    private boolean foodShulkerEmptied = false;
+    private boolean foodRestockExhausted = false;
+    private int foodReturnedBefore = -1;
+
     // Shared shulker-drop pickup (used by the loot-storage cycle AND the tool-restock cycle): after
     // breaking a placed shulker, walk onto its drop and confirm it's back in the inventory before moving
     // on. A broken shulker can bounce a block off the break spot, so we chase the actual ItemEntity —
@@ -726,6 +794,13 @@ public class MassExtractor extends Module {
         restocking = false;
         restockPhase = RestockPhase.PLACE_ECHEST;
         restockAbort = null;
+        foodRestocking = false;
+        foodPhase = FoodPhase.PLACE_ECHEST;
+        foodRestockAbort = null;
+        foodTookAny = false;
+        foodShulkerEmptied = false;
+        foodRestockExhausted = false;
+        foodReturnedBefore = -1;
         depositActive = (depositTarget.get() != DepositTarget.EnderChest);
         echestExhausted = false;
         depositPhase = DepositPhase.PATH_TO_DEPOSIT;
@@ -1101,6 +1176,7 @@ public class MassExtractor extends Module {
             case ECHEST_STORE -> tickEchestStore();
             case BREAK_ECHEST -> tickBreakEchest();
             case RESTOCK      -> tickRestock();
+            case FOOD_RESTOCK -> tickFoodRestock();
             case DEPOSIT      -> tickDeposit();
             case PAUSED       -> tickPaused();
             case DONE         -> finishStorage();
@@ -1151,6 +1227,25 @@ public class MassExtractor extends Module {
             return;
         }
 
+        // Food-shulker restock: out of food (good food on hand below the threshold) and an ender chest in
+        // hand to crack the food-shulker. Its own cycle, independent of the loot/tool cycles — fires on food
+        // COUNT, not hunger, so a fresh stack is staged before the hunger pause ever triggers. Best-effort:
+        // a missing/empty food-shulker warns + latches rather than stalling the run.
+        if (restockFood.get() && !foodRestockExhausted
+                && countGoodFood() < minFoodOnHand.get()
+                && countItem(Items.ENDER_CHEST) > 0) {
+            stopMining();
+            dbg("low on food (%d good-food item(s)) — starting food-shulker restock cycle", countGoodFood());
+            foodRestocking = true;                               // CLEAR_AREA routes to the food FSM
+            restocking = false;
+            foodRestockAbort = null;
+            foodTookAny = false;
+            foodShulkerEmptied = false;
+            foodPhase = FoodPhase.PLACE_ECHEST;
+            go(State.CLEAR_AREA);
+            return;
+        }
+
         // Mining is the stock-Baritone ClearArea quarry: clear the current chunk box, then spiral.
         tickClearAreaMining();
     }
@@ -1178,7 +1273,7 @@ public class MassExtractor extends Module {
                 }
             }
         }
-        go(restocking ? State.RESTOCK : State.PLACE_ECHEST); // pocket cleared
+        go(foodRestocking ? State.FOOD_RESTOCK : restocking ? State.RESTOCK : State.PLACE_ECHEST); // pocket cleared
         timer = nextDelay();
     }
 
@@ -2814,6 +2909,220 @@ public class MassExtractor extends Module {
         }
     }
 
+    // ---------------- Food-shulker restock cycle ----------------
+    // A self-contained mini state-machine (entered as State.FOOD_RESTOCK after CLEAR_AREA opens a pocket)
+    // that cracks a FOOD-SHULKER stored in the ender chest to refill food, then puts the shulker back. It
+    // mirrors the tool-shulker cycle exactly — every world/container action on its own tick + action-delay,
+    // and the break/pickup uses the shared settle → chase → confirm tracker — so it never bursts packets and
+    // a lag spike can't lose the shulker. The food-shulker is matched by its CONTENTS (a shulker holding
+    // edible, non-risky food), so loot shulkers are never touched and it needs no special colour/name. It is
+    // best-effort: a missing food-shulker (or one out of food) warns + latches rather than pausing, so a low
+    // food supply never stalls an AFK run (running low on food, unlike a broken tool, isn't fatal to mining).
+
+    /** Advance to a food sub-phase, resetting the shared step/attempts counters. */
+    private void setFoodPhase(FoodPhase p) {
+        if (p != foodPhase) dbg("food %s -> %s", foodPhase, p);
+        foodPhase = p;
+        step = 0;
+        attempts = 0;
+    }
+
+    private void tickFoodRestock() {
+        switch (foodPhase) {
+            case PLACE_ECHEST -> {
+                switch (tickPlace(s -> s.getItem() == Items.ENDER_CHEST)) {
+                    case DONE -> { placedEchest = pendingPlace; dbg("food: placed echest at %s", placedEchest.toShortString()); setFoodPhase(FoodPhase.OPEN_ECHEST); timer = nextDelay(); }
+                    case FAILED -> pause("Food restock: couldn't place ender chest.");
+                    case BUSY -> {}
+                }
+            }
+            case OPEN_ECHEST -> {
+                if (step == 0) { openBlock(placedEchest); step = 1; timer = nextDelay(); }
+                else if (isContainerOpen()) { setFoodPhase(FoodPhase.TAKE_SHULKER); timer = nextDelay(); }
+                else if (++attempts >= 20) pause("Food restock: ender chest didn't open.");
+                else timer = nextDelay();
+            }
+            case TAKE_SHULKER -> {
+                if (!isContainerOpen()) { pause("Food restock: ender chest closed unexpectedly."); return; }
+                ScreenHandler h = mc.player.currentScreenHandler;
+                int slot = findContainerSlot(h, this::isFoodShulker);
+                if (slot < 0) { // no food-shulker in the chest — recover the chest, then warn + latch (best-effort)
+                    closeScreen();
+                    foodRestockAbort = "Food restock: no food-shulker (holding edible food) in the ender chest — mining on without a refill.";
+                    setFoodPhase(FoodPhase.BREAK_ECHEST);
+                    timer = nextDelay();
+                    return;
+                }
+                int free = freeHotbarSlot();
+                if (free != -1) swapToHotbar(h, slot, free); else quickMove(h, slot);
+                dbg("food: pulled food-shulker to hotbar slot %d", free);
+                setFoodPhase(FoodPhase.CLOSE_ECHEST);
+                timer = nextDelay();
+            }
+            case CLOSE_ECHEST -> { closeScreen(); setFoodPhase(FoodPhase.PLACE_SHULKER); timer = nextDelay(); }
+            case PLACE_SHULKER -> {
+                switch (tickPlace(this::isFoodShulker)) {
+                    case DONE -> { placedShulker = pendingPlace; dbg("food: placed food-shulker at %s", placedShulker.toShortString()); setFoodPhase(FoodPhase.OPEN_SHULKER); timer = nextDelay(); }
+                    case FAILED -> pause("Food restock: couldn't place the food-shulker — " + placeFail + ".");
+                    case BUSY -> {}
+                }
+            }
+            case OPEN_SHULKER -> {
+                if (step == 0) { openBlock(placedShulker); step = 1; timer = nextDelay(); }
+                else if (isContainerOpen()) { setFoodPhase(FoodPhase.TAKE_FOOD); timer = nextDelay(); }
+                else if (++attempts >= 20) pause("Food restock: food-shulker didn't open.");
+                else timer = nextDelay();
+            }
+            case TAKE_FOOD -> { // pull good food by preference, one stack per tick, up to the restock count
+                if (!isContainerOpen()) { pause("Food restock: food-shulker closed unexpectedly."); return; }
+                ScreenHandler h = mc.player.currentScreenHandler;
+                int target = Math.max(foodRestockCount.get(), minFoodOnHand.get());
+                if (countGoodFood() >= target) { setFoodPhase(FoodPhase.CLOSE_SHULKER); timer = nextDelay(); return; }
+                int slot = findBestFoodContainerSlot(h);
+                if (slot < 0) {                      // shulker has no (more) good food
+                    foodShulkerEmptied = true;       // it's now empty of food — keep it recognisable for pickup/return
+                    setFoodPhase(FoodPhase.CLOSE_SHULKER);
+                    timer = nextDelay();
+                    return;
+                }
+                int free = freeHotbarSlot();
+                if (countGoodFood() == 0 && free != -1) swapToHotbar(h, slot, free); // first stack into the hotbar (for AutoEat)
+                else quickMove(h, slot);                                             // the rest into the main inventory
+                foodTookAny = true;
+                timer = fillMoveDelay();
+            }
+            case CLOSE_SHULKER -> { closeScreen(); setFoodPhase(FoodPhase.BREAK_SHULKER); timer = nextDelay(); }
+            case BREAK_SHULKER -> {
+                if (placedShulker != null && mc.world.getBlockState(placedShulker).getBlock() instanceof ShulkerBoxBlock) {
+                    if (!pickupSnapshotTaken) { beginPickup(this::isReturnableFoodShulker); pickupSnapshotTaken = true; } // snapshot BEFORE it pops
+                    BlockUtils.breakBlock(placedShulker, true); // continuous until it pops (drops with its remaining food)
+                    return; // breaking must run every tick — no action-delay here
+                }
+                pickupSnapshotTaken = false;                  // chase the drop before reopening
+                setFoodPhase(FoodPhase.PICKUP_SHULKER);
+                timer = nextDelay();
+            }
+            case PICKUP_SHULKER -> { // make sure the broken food-shulker is back in the inventory before reopening
+                switch (tickPickupDrop(placedShulker, this::isReturnableFoodShulker)) {
+                    case BUSY -> {}
+                    case GAVE_UP -> { dbg("food: gave up waiting for the food-shulker drop — proceeding"); placedShulker = null; setFoodPhase(FoodPhase.REOPEN_ECHEST); }
+                    case DONE -> { placedShulker = null; setFoodPhase(FoodPhase.REOPEN_ECHEST); }
+                }
+                timer = nextDelay();
+            }
+            case REOPEN_ECHEST -> {
+                if (step == 0) { openBlock(placedEchest); foodReturnedBefore = -1; step = 1; timer = nextDelay(); }
+                else if (isContainerOpen()) { setFoodPhase(FoodPhase.RETURN_SHULKER); timer = nextDelay(); }
+                else if (++attempts >= 20) pause("Food restock: ender chest didn't reopen.");
+                else timer = nextDelay();
+            }
+            case RETURN_SHULKER -> {
+                if (!isContainerOpen()) { pause("Food restock: ender chest closed unexpectedly."); return; }
+                ScreenHandler h = mc.player.currentScreenHandler;
+                // step 1: confirm the last shift-click actually landed the shulker in the chest before the next.
+                if (step == 1) {
+                    if (countContainerMatches(h, this::isReturnableFoodShulker) > foodReturnedBefore) {
+                        step = 0; attempts = 0;            // confirmed stored — look for another (or finish)
+                    } else if (++attempts > 20 * 3) {
+                        dbg("food: store of food-shulker not confirmed after 3s — retrying");
+                        step = 0; attempts = 0;
+                    } else { timer = nextDelay(); return; }
+                }
+                int playerSlot = findPlayerSlotInContainer(h, this::isReturnableFoodShulker);
+                if (playerSlot >= 0 && containerHasRoomFor(h, h.slots.get(playerSlot).getStack())) {
+                    foodReturnedBefore = countContainerMatches(h, this::isReturnableFoodShulker);
+                    quickMove(h, playerSlot);
+                    step = 1;                              // confirm it lands before recovering the echest
+                    timer = fillMoveDelay();
+                    return;
+                }
+                setFoodPhase(FoodPhase.CLOSE_ECHEST2);
+                timer = nextDelay();
+            }
+            case CLOSE_ECHEST2 -> { closeScreen(); setFoodPhase(FoodPhase.BREAK_ECHEST); timer = nextDelay(); }
+            case BREAK_ECHEST -> {
+                if (!breakAndCollectEchest()) return; // break + chase the ender chest drop before finishing
+                setFoodPhase(FoodPhase.DONE);
+                timer = nextDelay();
+            }
+            default -> { // DONE
+                foodRestocking = false;
+                if (!foodTookAny) { // found no food-shulker, or it held no edible food — warn once and latch
+                    foodRestockExhausted = true;
+                    warning(foodRestockAbort != null ? foodRestockAbort
+                        : "Food restock: the food-shulker held no edible food — mining on without a refill.");
+                    foodRestockAbort = null;
+                } else {
+                    dbg("food restock complete (%d good-food item(s) on hand) — resuming mining", countGoodFood());
+                    info("Restocked food.");
+                }
+                resumeMining();
+            }
+        }
+    }
+
+    // ---- Food detection + preference ----
+
+    /** High-saturation processed/cooked staples — preference tier 4 (above natural/uncooked food). */
+    private static final java.util.Set<Item> COOKED_FOODS = java.util.Set.of(
+        Items.COOKED_BEEF, Items.COOKED_PORKCHOP, Items.COOKED_CHICKEN, Items.COOKED_MUTTON,
+        Items.COOKED_RABBIT, Items.COOKED_COD, Items.COOKED_SALMON,
+        Items.BREAD, Items.BAKED_POTATO, Items.PUMPKIN_PIE, Items.DRIED_KELP
+    );
+
+    /** An edible food we're happy to keep/eat: has the FOOD component and isn't a risky (harmful/teleport/stew) food. */
+    private boolean isGoodFood(ItemStack s) {
+        return !s.isEmpty() && s.contains(DataComponentTypes.FOOD) && !isRiskyFood(s);
+    }
+
+    /** Total good-food ITEM count (summed stack sizes) in the inventory — the food-restock trigger/target metric. */
+    private int countGoodFood() { return countItemsMatching(this::isGoodFood); }
+
+    /**
+     * Preference rank for restocking food (lower = grabbed first): golden carrot (1), enchanted golden
+     * apple (2), golden apple (3), cooked meats / bread / other processed staples (4), then any other
+     * edible food — natural/uncooked like apples and carrots (5).
+     */
+    private int foodPriority(Item i) {
+        if (i == Items.GOLDEN_CARROT) return 1;
+        if (i == Items.ENCHANTED_GOLDEN_APPLE) return 2;
+        if (i == Items.GOLDEN_APPLE) return 3;
+        if (COOKED_FOODS.contains(i)) return 4;
+        return 5;
+    }
+
+    /** Container-half slot of the highest-preference good food in the open shulker, or -1 if it holds none. */
+    private int findBestFoodContainerSlot(ScreenHandler h) {
+        int containerSlots = h.slots.size() - 36;
+        int best = -1, bestPriority = Integer.MAX_VALUE;
+        for (int i = 0; i < containerSlots; i++) {
+            ItemStack s = h.slots.get(i).getStack();
+            if (!isGoodFood(s)) continue;
+            int p = foodPriority(s.getItem());
+            if (p < bestPriority) { bestPriority = p; best = i; }
+        }
+        return best;
+    }
+
+    /** A shulker that holds at least one good (edible, non-risky) food — the food-shulker the cycle cracks. */
+    private boolean isFoodShulker(ItemStack s) {
+        if (!isShulker(s)) return false;
+        var c = s.get(DataComponentTypes.CONTAINER);
+        if (c == null) return false;
+        return c.stream().anyMatch(this::isGoodFood);
+    }
+
+    /**
+     * The shulker to chase/return after the food cycle: the food-shulker (still holding food), or — once
+     * we've emptied it of food this cycle — the now-empty shulker. Only matching the empty case while
+     * {@code foodShulkerEmptied} is set keeps a spare empty shulker from being mistaken for it on a normal
+     * (food still inside) refill; on the rare emptied refill a stray empty simply rides back into the
+     * echest buffer too, which is harmless (empties belong in the echest anyway).
+     */
+    private boolean isReturnableFoodShulker(ItemStack s) {
+        return isFoodShulker(s) || (foodShulkerEmptied && isEmptyShulkerStack(s));
+    }
+
     /** True when there is NO fresh tool of the restock type anywhere in the inventory — time to restock. */
     private boolean toolNeedsRestock() {
         final ToolType t = toolType.get() == ToolType.Auto ? autoToolType() : toolType.get();
@@ -3095,6 +3404,7 @@ public class MassExtractor extends Module {
         if (state == State.COLLECT) return "collecting drops";
         if (state == State.SELECT) return "select " + (corner1 == null ? "corner 1" : "corner 2");
         if (state == State.RESTOCK) return "restock " + restockPhase.name().toLowerCase();
+        if (state == State.FOOD_RESTOCK) return "food " + foodPhase.name().toLowerCase();
         if (state == State.DEPOSIT) return "deposit " + depositPhase.name().toLowerCase();
         if (areaLimited && state == State.MINING)
             return String.format("mining y%d..%d  chunk %d/%d", curLayerBottomY(), curLayerTopY, areaChunksDone, areaChunksTotal);
