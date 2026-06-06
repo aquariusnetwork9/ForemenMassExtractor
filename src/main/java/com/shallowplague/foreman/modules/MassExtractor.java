@@ -559,8 +559,10 @@ public class MassExtractor extends Module {
         PLACE_SHULKER,  // place the tool-shulker
         OPEN_SHULKER,   // open it
         TAKE_TOOL,      // grab a fresh tool into the hotbar
+        STOW_TOOL,      // put the worn (not broken) tool(s) back into the shulker
         CLOSE_SHULKER,  // close it
-        BREAK_SHULKER,  // break + collect the tool-shulker (keeps its remaining tools)
+        BREAK_SHULKER,  // break the tool-shulker (drops with its remaining + stowed tools)
+        PICKUP_SHULKER, // wait until the dropped tool-shulker is collected
         REOPEN_ECHEST,  // reopen the ender chest
         RETURN_SHULKER, // put the tool-shulker back in the chest
         CLOSE_ECHEST2,  // close the chest
@@ -664,6 +666,8 @@ public class MassExtractor extends Module {
     private boolean restocking = false;
     private RestockPhase restockPhase = RestockPhase.PLACE_ECHEST;
     private String restockAbort = null;
+    private boolean restockTookFresh = false; // did TAKE_TOOL get a fresh tool (so we may stow the worn one)?
+    private int restockShulkersBefore = 0;    // tool-bearing shulkers in inv before the placed one is recovered
 
     // Deposit-chest trip (State.DEPOSIT). 'depositActive' = the bot uses fixed deposit/supply chests at a
     // base (any deposit-target other than EnderChest). The ender chest stays the FIELD buffer (filled
@@ -2557,8 +2561,13 @@ public class MassExtractor extends Module {
             case CLOSE_ECHEST -> { closeScreen(); setRestockPhase(RestockPhase.PLACE_SHULKER); timer = nextDelay(); }
             case PLACE_SHULKER -> {
                 switch (tickPlace(this::isToolShulker)) {
-                    case DONE -> { placedShulker = pendingPlace; dbg("restock: placed tool-shulker at %s", placedShulker.toShortString()); setRestockPhase(RestockPhase.OPEN_SHULKER); timer = nextDelay(); }
-                    case FAILED -> pause("Restock: couldn't place the tool-shulker.");
+                    case DONE -> {
+                        placedShulker = pendingPlace;
+                        restockShulkersBefore = countShulkers(this::isToolBearingShulker); // placed one is out of inv now
+                        dbg("restock: placed tool-shulker at %s (spare tool-shulkers in inv: %d)", placedShulker.toShortString(), restockShulkersBefore);
+                        setRestockPhase(RestockPhase.OPEN_SHULKER); timer = nextDelay();
+                    }
+                    case FAILED -> pause("Restock: couldn't place the tool-shulker — " + placeFail + ".");
                     case BUSY -> {}
                 }
             }
@@ -2572,25 +2581,56 @@ public class MassExtractor extends Module {
                 if (!isContainerOpen()) { pause("Restock: tool-shulker closed unexpectedly."); return; }
                 ScreenHandler h = mc.player.currentScreenHandler;
                 int slot = findContainerSlot(h, s -> isFreshTool(s, t));
+                restockTookFresh = slot >= 0;
                 if (slot >= 0) {
                     int free = freeHotbarSlot();
                     if (free != -1) swapToHotbar(h, slot, free); else quickMove(h, slot);
                     dbg("restock: took fresh %s into hotbar slot %d", t, free);
                     info("Restocked %s from shulker.", t.name().toLowerCase());
                 } else {
-                    dbg("restock: no fresh %s left inside the tool-shulker", t); // still recover/return it
+                    dbg("restock: no fresh %s left inside the tool-shulker", t); // keep the worn one; still recover/return the shulker
                 }
-                setRestockPhase(RestockPhase.CLOSE_SHULKER);
+                setRestockPhase(RestockPhase.STOW_TOOL);
+                timer = nextDelay();
+            }
+            case STOW_TOOL -> { // put the worn (not broken) tool(s) back into the shulker — only if we got a fresh one
+                if (!isContainerOpen()) { pause("Restock: tool-shulker closed unexpectedly."); return; }
+                if (!restockTookFresh) { setRestockPhase(RestockPhase.CLOSE_SHULKER); timer = nextDelay(); return; }
+                ScreenHandler h = mc.player.currentScreenHandler;
+                int worn = findPlayerSlotInContainer(h, s -> isSpentTool(s, t));
+                if (worn >= 0 && containerHasRoomFor(h, h.slots.get(worn).getStack())) {
+                    quickMove(h, worn);                 // one worn tool into the shulker, then loop
+                    dbg("restock: stowed a spent %s back into the tool-shulker", t);
+                    timer = fillMoveDelay();
+                    return;
+                }
+                setRestockPhase(RestockPhase.CLOSE_SHULKER); // no more worn tools (or shulker full)
                 timer = nextDelay();
             }
             case CLOSE_SHULKER -> { closeScreen(); setRestockPhase(RestockPhase.BREAK_SHULKER); timer = nextDelay(); }
             case BREAK_SHULKER -> {
                 if (placedShulker != null && mc.world.getBlockState(placedShulker).getBlock() instanceof ShulkerBoxBlock) {
-                    BlockUtils.breakBlock(placedShulker, true); // continuous until it pops (drops with its remaining tools)
+                    BlockUtils.breakBlock(placedShulker, true); // continuous until it pops (drops with its remaining + stowed tools)
                     return; // breaking must run every tick — no action-delay here
                 }
-                placedShulker = null;
-                setRestockPhase(RestockPhase.REOPEN_ECHEST);
+                setRestockPhase(RestockPhase.PICKUP_SHULKER); // wait for the drop to be collected before reopening
+                timer = nextDelay();
+            }
+            case PICKUP_SHULKER -> { // make sure the broken tool-shulker is back in the inventory before reopening
+                if (countShulkers(this::isToolBearingShulker) > restockShulkersBefore) {
+                    if (baritone != null) baritone.getPathingBehavior().cancelEverything(); // stop any nudge walk
+                    placedShulker = null;
+                    setRestockPhase(RestockPhase.REOPEN_ECHEST);
+                    timer = nextDelay();
+                    return;
+                }
+                if (step == 0 && placedShulker != null) { pathToBlock(placedShulker); step = 1; } // walk onto the drop
+                if (++attempts > 20 * 8) { // gave up after ~8s — proceed (RETURN_SHULKER will no-op if absent)
+                    if (baritone != null) baritone.getPathingBehavior().cancelEverything();
+                    dbg("restock: gave up waiting for the tool-shulker drop — proceeding");
+                    placedShulker = null;
+                    setRestockPhase(RestockPhase.REOPEN_ECHEST);
+                }
                 timer = nextDelay();
             }
             case REOPEN_ECHEST -> {
@@ -2643,6 +2683,15 @@ public class MassExtractor extends Module {
         if (s.isEmpty() || !isToolOfType(s, t)) return false;
         if ((s.getMaxDamage() - s.getDamage()) < restockDurability.get()) return false;
         return !reserveSilk.get() || !Utils.hasEnchantments(s, Enchantments.SILK_TOUCH);
+    }
+
+    /** A SPENT tool worth stowing back in the shulker: right type, worn below the restock threshold but NOT
+     *  broken, and never the reserved Silk Touch tool (which stays in the inventory for ender chests). */
+    private boolean isSpentTool(ItemStack s, ToolType t) {
+        if (s.isEmpty() || !isToolOfType(s, t)) return false;
+        if (reserveSilk.get() && Utils.hasEnchantments(s, Enchantments.SILK_TOUCH)) return false;
+        int rem = s.getMaxDamage() - s.getDamage();
+        return rem > 0 && rem < restockDurability.get();
     }
 
     /** A shulker that holds at least one FRESH tool of the restock type (the one we pull a tool from). */
