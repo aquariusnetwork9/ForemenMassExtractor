@@ -2776,7 +2776,10 @@ public class MassExtractor extends Module {
     private boolean dropOneHotbarTarget() {
         var inv = mc.player.getInventory();
         for (int i = 0; i <= 8; i++) {
-            if (!isTargetStack(inv.getStack(i))) continue;
+            ItemStack s = inv.getStack(i);
+            // ONLY ever throw a target/keep block, and NEVER gear: a hard backstop so this can't lose a
+            // tool, food, shulker, or ender chest even if one were mistakenly added to keep-items.
+            if (!isTargetStack(s) || isReservedFromDrop(s)) continue;
             ScreenHandler h;
             int screenSlot;
             if (isContainerOpen()) { h = mc.player.currentScreenHandler; screenSlot = h.slots.size() - 9 + i; }
@@ -2786,6 +2789,18 @@ public class MassExtractor extends Module {
             return true;
         }
         return false;
+    }
+
+    /**
+     * Items the bot must NEVER throw away to free a staging slot, regardless of config: food (kept for
+     * AutoEat), shulker boxes (empty or filled — the storage), the ender chest (the field buffer), and
+     * anything with durability (tools/weapons/armour). The hotbar drop only relinquishes target blocks.
+     */
+    private boolean isReservedFromDrop(ItemStack s) {
+        return s.contains(DataComponentTypes.FOOD)
+            || isShulker(s)
+            || s.getItem() == Items.ENDER_CHEST
+            || s.isDamageable();
     }
 
     /**
