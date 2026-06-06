@@ -668,6 +668,11 @@ public class MassExtractor extends Module {
     private String restockAbort = null;
     private boolean restockTookFresh = false; // did TAKE_TOOL get a fresh tool (so we may stow the worn one)?
     private int restockShulkersBefore = 0;    // tool-bearing shulkers in inv before the placed one is recovered
+    private ItemEntity restockDrop = null;    // PICKUP_SHULKER: the broken tool-shulker drop we're walking to
+    private boolean restockPathed = false;    // PICKUP_SHULKER: issued the path to the drop yet (false = still settling)
+    private int restockSettleTicks = 0;       // PICKUP_SHULKER: ticks waited for the drop to settle on the ground
+    private BlockPos restockGoal = null;      // PICKUP_SHULKER: block we last pathed to (re-path when the drop drifts)
+    private int restockReturnedBefore = -1;   // RETURN_SHULKER: tool-shulkers in the echest before the store (confirm it lands)
 
     // Deposit-chest trip (State.DEPOSIT). 'depositActive' = the bot uses fixed deposit/supply chests at a
     // base (any deposit-target other than EnderChest). The ender chest stays the FIELD buffer (filled
@@ -2198,6 +2203,19 @@ public class MassExtractor extends Module {
         return best;
     }
 
+    /** Nearest dropped tool-shulker item within a few blocks of where we just broke it (it can bounce off). */
+    private ItemEntity nearestDroppedShulker(BlockPos near) {
+        if (near == null || mc.world == null) return null;
+        ItemEntity best = null;
+        double bestSq = Double.MAX_VALUE;
+        for (ItemEntity e : mc.world.getEntitiesByClass(ItemEntity.class, new Box(near).expand(4),
+                e -> e.isAlive() && isToolBearingShulker(e.getStack()))) {
+            double d = e.squaredDistanceTo(mc.player);
+            if (d < bestSq) { bestSq = d; best = e; }
+        }
+        return best;
+    }
+
     /** The sub-box XZ footprint (with a small margin) over the active Y band — where drops can rest. */
     private Box collectArea() {
         int yLo = (areaLimited ? curLayerBottomY() : minYLevel.get()) - 2;
@@ -2613,23 +2631,47 @@ public class MassExtractor extends Module {
                     BlockUtils.breakBlock(placedShulker, true); // continuous until it pops (drops with its remaining + stowed tools)
                     return; // breaking must run every tick — no action-delay here
                 }
+                restockDrop = null; restockPathed = false; restockSettleTicks = 0; restockGoal = null;
                 setRestockPhase(RestockPhase.PICKUP_SHULKER); // wait for the drop to be collected before reopening
                 timer = nextDelay();
             }
             case PICKUP_SHULKER -> { // make sure the broken tool-shulker is back in the inventory before reopening
+                // Success: the shulker item is back in our inventory.
                 if (countShulkers(this::isToolBearingShulker) > restockShulkersBefore) {
-                    if (baritone != null) baritone.getPathingBehavior().cancelEverything(); // stop any nudge walk
+                    if (baritone != null) baritone.getPathingBehavior().cancelEverything(); // stop the nudge walk
+                    restockDrop = null; restockGoal = null;
                     placedShulker = null;
                     setRestockPhase(RestockPhase.REOPEN_ECHEST);
                     timer = nextDelay();
                     return;
                 }
-                if (step == 0 && placedShulker != null) { pathToBlock(placedShulker); step = 1; } // walk onto the drop
-                if (++attempts > 20 * 8) { // gave up after ~8s — proceed (RETURN_SHULKER will no-op if absent)
+                // Overall give-up cap (~10s): proceed; RETURN_SHULKER no-ops if the shulker is truly gone.
+                if (++attempts > 20 * 10) {
                     if (baritone != null) baritone.getPathingBehavior().cancelEverything();
                     dbg("restock: gave up waiting for the tool-shulker drop — proceeding");
-                    placedShulker = null;
+                    restockDrop = null; restockGoal = null; placedShulker = null;
                     setRestockPhase(RestockPhase.REOPEN_ECHEST);
+                    timer = nextDelay();
+                    return;
+                }
+                // (Re)acquire the dropped shulker item — it can pop a block off the break spot.
+                if (restockDrop == null || !restockDrop.isAlive() || restockDrop.isRemoved()) {
+                    restockDrop = nearestDroppedShulker(placedShulker);
+                    restockPathed = false; restockSettleTicks = 0; restockGoal = null;
+                }
+                if (restockDrop != null) {
+                    // Settle delay: let the freshly-broken shulker come to rest before chasing it, so we path
+                    // to where it actually lands (it may bounce a block over) instead of a stale spot.
+                    if (!restockDrop.isOnGround() && ++restockSettleTicks < COLLECT_SETTLE_TICKS) { timer = nextDelay(); return; }
+                    // Re-path whenever the drop has drifted to a new block, so a bounce a block away is chased.
+                    BlockPos cur = restockDrop.getBlockPos();
+                    if (!restockPathed || !cur.equals(restockGoal)) {
+                        pathToBlock(cur);          // stand ON the drop (2b won't always grab it from a block away)
+                        restockGoal = cur;
+                        restockPathed = true;
+                    }
+                } else if (step == 0 && placedShulker != null) {
+                    pathToBlock(placedShulker); step = 1; // no entity in range yet — at least walk to the break spot
                 }
                 timer = nextDelay();
             }
@@ -2642,11 +2684,22 @@ public class MassExtractor extends Module {
             case RETURN_SHULKER -> {
                 if (!isContainerOpen()) { pause("Restock: ender chest closed unexpectedly."); return; }
                 ScreenHandler h = mc.player.currentScreenHandler;
+                // step 1: waiting to confirm the last shift-click actually landed the shulker in the chest.
+                if (step == 1) {
+                    if (countContainerMatches(h, this::isToolBearingShulker) > restockReturnedBefore) {
+                        step = 0; attempts = 0;            // confirmed stored — look for another (or finish)
+                    } else if (++attempts > 20 * 3) {
+                        dbg("restock: store of tool-shulker not confirmed after 3s — retrying"); // re-issue below
+                        step = 0; attempts = 0;
+                    } else { timer = nextDelay(); return; }
+                }
                 int playerSlot = findPlayerSlotInContainer(h, this::isToolBearingShulker);
                 if (playerSlot >= 0 && containerHasRoomFor(h, h.slots.get(playerSlot).getStack())) {
+                    restockReturnedBefore = countContainerMatches(h, this::isToolBearingShulker);
                     quickMove(h, playerSlot);
+                    step = 1;                              // confirm it lands before recovering the echest
                     timer = fillMoveDelay();
-                    return; // loop: store another tool-bearing shulker if we picked up more than one
+                    return;
                 }
                 setRestockPhase(RestockPhase.CLOSE_ECHEST2);
                 timer = nextDelay();
@@ -2738,6 +2791,14 @@ public class MassExtractor extends Module {
             if (p.test(slot.getStack())) return i;
         }
         return -1;
+    }
+
+    /** Count stacks in the container half (the chest/shulker, not the player rows) matching p. */
+    private int countContainerMatches(ScreenHandler h, java.util.function.Predicate<ItemStack> p) {
+        int containerSlots = h.slots.size() - 36;
+        int n = 0;
+        for (int i = 0; i < containerSlots; i++) if (p.test(h.slots.get(i).getStack())) n++;
+        return n;
     }
 
     /** Count the empty slots in the container half (used to size a refill to the echest's free space). */
