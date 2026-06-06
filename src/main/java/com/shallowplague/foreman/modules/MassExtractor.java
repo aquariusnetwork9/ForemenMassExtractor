@@ -605,6 +605,8 @@ public class MassExtractor extends Module {
     private BlockPos placedEchest = null;   // where we placed the ender chest this cycle
     private BlockPos placedShulker = null;  // where we placed the shulker this cycle
     private BlockPos pendingPlace = null;   // chosen spot mid-placement (between sub-steps)
+    private String placeFail = "";          // why the last tickPlace returned FAILED (for the pause message)
+    private final java.util.Set<BlockPos> placeTried = new java.util.HashSet<>(); // spots a place packet failed on this attempt
     private String doneReason = "storage full"; // why the DONE state was entered (for the message/action)
     private IBaritone baritone;
     private final java.util.Random random = new java.util.Random();
@@ -1135,11 +1137,10 @@ public class MassExtractor extends Module {
     // ----- CLEAR_AREA: open a pocket so the echest + shulker both have somewhere to go -----
 
     private void tickClearArea() {
-        // Before placing anything, make sure the hotbar has a free slot to stage the echest and shulker.
-        // Evict a target the hotbar picked up during mining into the main inventory; if the main inventory
-        // is full too, drop one (re-collected next cycle) — otherwise a hotbar full of target blocks (common
-        // with 2+ keep-items) leaves no slot to stage the echest and the storage cycle fails.
-        if (freeHotbarSlot() == -1 && freeHotbarForStaging()) { timer = nextDelay(); return; }
+        // Tidy the hotbar: shift a target block the hotbar picked up during mining back into the main
+        // inventory when there's room. (Staging the echest/shulker no longer needs a *free* hotbar slot —
+        // tickPlace swaps into the hotbar if it's full — so this is just housekeeping, never a blocker.)
+        if (sweepHotbarTargets()) { timer = nextDelay(); return; }
 
         BlockPos feet = mc.player.getBlockPos();
         // Break the four horizontal neighbours at feet + head height, leaving the floor
@@ -1165,7 +1166,7 @@ public class MassExtractor extends Module {
     private void tickPlaceEchest() {
         switch (tickPlace(s -> s.getItem() == Items.ENDER_CHEST)) {
             case DONE -> { placedEchest = pendingPlace; dbg("placed ender chest at %s", placedEchest.toShortString()); go(State.ECHEST_TAKE); timer = nextDelay(); }
-            case FAILED -> pause("Couldn't place ender chest (no spot or no free hotbar slot).");
+            case FAILED -> pause("Couldn't place ender chest — " + placeFail + ".");
             case BUSY -> {}
         }
     }
@@ -1203,10 +1204,8 @@ public class MassExtractor extends Module {
                 int shulkerSlot = findContainerSlot(h, this::isEmptyShulker);
                 if (shulkerSlot >= 0) {
                     int free = freeHotbarSlot();
-                    if (free == -1 && dropOneHotbarTarget()) { timer = nextDelay(); return; } // free a hotbar slot, retry
-                    free = freeHotbarSlot();
                     if (free != -1) swapToHotbar(h, shulkerSlot, free); // one packet, lands in hotbar
-                    else quickMove(h, shulkerSlot);                     // fallback: at least pull it out
+                    else quickMove(h, shulkerSlot);                     // fallback: at least pull it out (PLACE_SHULKER then stages it)
                     dbg("pulled empty shulker to hotbar slot %d", free);
                     step = 5;
                 } else if (countShulkers(this::isEmptyShulkerInInv) > 0) {
@@ -1238,7 +1237,7 @@ public class MassExtractor extends Module {
     private void tickPlaceShulker() {
         switch (tickPlace(this::isEmptyShulkerStack)) {
             case DONE -> { placedShulker = pendingPlace; dbg("placed shulker at %s", placedShulker.toShortString()); go(State.SHULKER_FILL); timer = nextDelay(); }
-            case FAILED -> pause("Couldn't place shulker (no spot or no free hotbar slot).");
+            case FAILED -> pause("Couldn't place shulker — " + placeFail + ".");
             case BUSY -> {}
         }
     }
@@ -1758,27 +1757,37 @@ public class MassExtractor extends Module {
     private Place tickPlace(java.util.function.Predicate<ItemStack> pred) {
         switch (step) {
             case 0 -> { // choose a spot
-                pendingPlace = findPlacementSpot();
-                if (pendingPlace == null) return Place.FAILED;
+                placeTried.clear();
+                pendingPlace = findPlacementSpot(placeTried);
+                if (pendingPlace == null) { placeFail = "no open spot beside the bot"; return Place.FAILED; }
                 step = 1; attempts = 0; timer = nextDelay();
                 return Place.BUSY;
             }
-            case 1 -> { // ensure the item is in the hotbar
+            case 1 -> { // ensure the item is in the hotbar (so InvUtils/BlockUtils can select + place it)
                 if (InvUtils.findInHotbar(pred).found()) { step = 3; attempts = 0; timer = nextDelay(); return Place.BUSY; }
-                FindItemResult any = InvUtils.find(pred);
-                if (!any.found()) return Place.FAILED;            // lost the item
                 int free = freeHotbarSlot();
-                if (free == -1) {                                 // hotbar full — free a slot
-                    if (freeHotbarForStaging()) { timer = nextDelay(); return Place.BUSY; } // moved or dropped a target, retry
-                    return Place.FAILED;                          // genuinely no room (all tools/echest/food)
+                if (free != -1) {                                 // a free hotbar slot -> simple move
+                    FindItemResult any = InvUtils.find(pred);
+                    if (!any.found()) { placeFail = "lost the item"; return Place.FAILED; }
+                    InvUtils.move().from(any.slot()).toHotbar(free);
+                    attempts = 0; step = 2; timer = nextDelay();
+                    return Place.BUSY;
                 }
-                InvUtils.move().from(any.slot()).toHotbar(free);  // main -> hotbar
+                // Hotbar full: SWAP the item (from the main inventory) into a hotbar slot, displacing a
+                // target block or a spare shulker/ender chest — which just moves to the item's old main slot.
+                // Nothing is dropped (so it can't loop on re-pickup), nothing is lost, and tools/food are
+                // never displaced. Works no matter how full the inventory is.
+                int srcMain = mainSlotMatching(pred);
+                if (srcMain == -1) { placeFail = "item isn't in the main inventory to stage"; return Place.FAILED; }
+                int hbSlot = hotbarSwapSlot();
+                if (hbSlot == -1) { placeFail = "hotbar is all tools/food — no slot to stage into"; return Place.FAILED; }
+                mc.interactionManager.clickSlot(mc.player.playerScreenHandler.syncId, srcMain, hbSlot, SlotActionType.SWAP, mc.player);
                 attempts = 0; step = 2; timer = nextDelay();
                 return Place.BUSY;
             }
-            case 2 -> { // wait for the move to land
+            case 2 -> { // wait for the move/swap to land
                 if (InvUtils.findInHotbar(pred).found()) { step = 3; attempts = 0; }
-                else if (++attempts >= 5) return Place.FAILED;
+                else if (++attempts >= 5) { placeFail = "item never reached the hotbar"; return Place.FAILED; }
                 timer = nextDelay();
                 return Place.BUSY;
             }
@@ -1788,7 +1797,13 @@ public class MassExtractor extends Module {
                     timer = nextDelay();
                     return Place.DONE;
                 }
-                if (++attempts >= 6) return Place.FAILED;
+                if (++attempts >= 4) { // this spot won't take the block — blacklist it and try another
+                    placeTried.add(pendingPlace);
+                    BlockPos next = findPlacementSpot(placeTried);
+                    if (next == null) { placeFail = "couldn't place at any open spot near the bot"; return Place.FAILED; }
+                    dbg("place failed at %s — trying spot %s", pendingPlace.toShortString(), next.toShortString());
+                    pendingPlace = next; attempts = 0;
+                }
                 timer = nextDelay();
                 return Place.BUSY;
             }
@@ -2717,19 +2732,41 @@ public class MassExtractor extends Module {
 
     // ---------------- Placement + safety ----------------
 
-    /** Find a spot adjacent to the player with solid support and air above, to place on. */
-    private BlockPos findPlacementSpot() {
+    /**
+     * Find an air block beside the bot to place storage in, that the game can actually place against.
+     * Checks both feet and head level, preferring a spot sitting on a solid block (rests on the floor),
+     * then falling back to any air spot with a solid orthogonal face to place against (a wall/floor side).
+     * In the top-down thin-layer quarry the bot is often in a 2-tall slot, so head-level + side-face spots
+     * matter. Skips anything in {@code avoid} (spots a place packet already failed on) and below the floor.
+     */
+    private BlockPos findPlacementSpot(java.util.Set<BlockPos> avoid) {
         BlockPos feet = mc.player.getBlockPos();
-        for (Direction dir : HORIZONTAL) {
-            BlockPos target = feet.offset(dir);
-            if (target.getY() < minYLevel.get()) continue; // never place storage below the floor
-            BlockPos below = target.down();
-            if (mc.world.getBlockState(target).isReplaceable()
-                && !mc.world.getBlockState(below).isReplaceable()) {
-                return target;
-            }
+        // 1) preferred: air beside the bot (feet then head level) resting on a solid block
+        for (int dy = 0; dy <= 1; dy++) for (Direction dir : HORIZONTAL) {
+            BlockPos t = feet.up(dy).offset(dir);
+            if (t.getY() < minYLevel.get() || avoid.contains(t)) continue;
+            if (isAirAt(t) && isSolidAt(t.down())) return t;
+        }
+        // 2) fallback: air beside the bot with ANY solid orthogonal face to place against
+        for (int dy = 0; dy <= 1; dy++) for (Direction dir : HORIZONTAL) {
+            BlockPos t = feet.up(dy).offset(dir);
+            if (t.getY() < minYLevel.get() || avoid.contains(t)) continue;
+            if (isAirAt(t) && hasAnySolidFace(t, feet)) return t;
         }
         return null;
+    }
+
+    private boolean isAirAt(BlockPos p)   { return mc.world.getBlockState(p).isReplaceable(); }
+    private boolean isSolidAt(BlockPos p) { return !mc.world.getBlockState(p).isReplaceable(); }
+
+    /** True if {@code p} has a solid orthogonal neighbour to place against (excluding the bot's own body). */
+    private boolean hasAnySolidFace(BlockPos p, BlockPos feet) {
+        for (Direction d : Direction.values()) {
+            BlockPos n = p.offset(d);
+            if (n.equals(feet) || n.equals(feet.up())) continue; // the bot itself isn't a support
+            if (isSolidAt(n)) return true;
+        }
+        return false;
     }
 
     /** First empty hotbar slot (0-8), or -1 if the hotbar is full. */
@@ -2766,52 +2803,34 @@ public class MassExtractor extends Module {
         return false;
     }
 
-    /**
-     * Throw ONE target stack out of the hotbar to free a staging slot, when the main inventory is full so
-     * it can't be relocated. The dropped blocks land on the ground and are re-collected on the next mining
-     * cycle (the user's accepted trade). Works whether or not a container is open — in an open container the
-     * player's hotbar is the last 9 of the trailing 36 slots; in the player's own screen it's slots 36..44.
-     * Returns true if it dropped one.
-     */
-    private boolean dropOneHotbarTarget() {
+    /** The main-inventory index (9-35) of the first stack matching {@code pred}, or -1. In the player's own
+     *  screen handler this index equals the screen slot, so it's directly usable for a SWAP click. */
+    private int mainSlotMatching(java.util.function.Predicate<ItemStack> pred) {
         var inv = mc.player.getInventory();
+        for (int j = 9; j <= 35; j++) if (pred.test(inv.getStack(j))) return j;
+        return -1;
+    }
+
+    /**
+     * A hotbar slot (0-8) we can SWAP a staging item into without losing or disrupting gear: prefer a target
+     * block (bulk haul), else any non-pinned item (a spare shulker / ender chest — these just move to the
+     * main inventory, nothing lost). Tools, weapons, armour and food are pinned and never displaced. -1 if
+     * the whole hotbar is pinned gear.
+     */
+    private int hotbarSwapSlot() {
+        var inv = mc.player.getInventory();
+        for (int i = 0; i <= 8; i++) if (isTargetStack(inv.getStack(i))) return i;     // displace a target first
         for (int i = 0; i <= 8; i++) {
             ItemStack s = inv.getStack(i);
-            // ONLY ever throw a target/keep block, and NEVER gear: a hard backstop so this can't lose a
-            // tool, food, shulker, or ender chest even if one were mistakenly added to keep-items.
-            if (!isTargetStack(s) || isReservedFromDrop(s)) continue;
-            ScreenHandler h;
-            int screenSlot;
-            if (isContainerOpen()) { h = mc.player.currentScreenHandler; screenSlot = h.slots.size() - 9 + i; }
-            else                   { h = mc.player.playerScreenHandler;   screenSlot = 36 + i; }
-            mc.interactionManager.clickSlot(h.syncId, screenSlot, 1, SlotActionType.THROW, mc.player); // button 1 = whole stack
-            dbg("dropped hotbar target (hotbar slot %d) to free a staging slot — re-collected next mining cycle", i);
-            return true;
+            if (!s.isEmpty() && !isHotbarPinned(s)) return i;                            // else a spare shulker/echest
         }
-        return false;
+        return -1;
     }
 
-    /**
-     * Items the bot must NEVER throw away to free a staging slot, regardless of config: food (kept for
-     * AutoEat), shulker boxes (empty or filled — the storage), the ender chest (the field buffer), and
-     * anything with durability (tools/weapons/armour). The hotbar drop only relinquishes target blocks.
-     */
-    private boolean isReservedFromDrop(ItemStack s) {
-        return s.contains(DataComponentTypes.FOOD)
-            || isShulker(s)
-            || s.getItem() == Items.ENDER_CHEST
-            || s.isDamageable();
-    }
-
-    /**
-     * Make sure the hotbar can stage the echest/shulker: relocate a hotbar target into the main inventory
-     * (preferred), or — when the main inventory is full too — drop one. Returns true if it freed (or is
-     * freeing) a slot this tick; the caller should wait a tick and retry. Caller must have NO container
-     * open (it may use {@link #sweepHotbarTargets}); {@link #dropOneHotbarTarget} handles the open case.
-     */
-    private boolean freeHotbarForStaging() {
-        if (sweepHotbarTargets()) return true;   // moved one into the main inventory
-        return dropOneHotbarTarget();            // main full -> drop one (re-collected next cycle)
+    /** Items kept in the hotbar (never displaced to stage something): food (for AutoEat) and anything with
+     *  durability (tools / weapons / armour). Targets, shulkers and ender chests are NOT pinned. */
+    private boolean isHotbarPinned(ItemStack s) {
+        return s.contains(DataComponentTypes.FOOD) || s.isDamageable();
     }
 
     /** True if the main inventory (slots 9-35) has an empty slot or a non-full stack matching {@code s}. */
