@@ -160,6 +160,22 @@ public class MassExtractor extends Module {
         .build()
     );
 
+    private final Setting<Boolean> verifyClears = sgGeneral.add(new BoolSetting.Builder()
+        .name("verify-clears")
+        .description("After a sub-box finishes (or stalls), scan it for any solid block the quarry should have cleared but didn't — a lag spike can make Baritone report a box done, or give up on a stall, with blocks still standing. If leftovers remain, RE-RUN that sub-box (up to 'clear-retries' times) before moving on, instead of leaving a gap. Bedrock and the block under the bot's feet are ignored, and the per-box retry cap means a genuinely unreachable block can never loop the run. Cheap (a small box scan) and only matters on laggy servers; turn off to always trust Baritone's first pass.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Integer> clearRetries = sgGeneral.add(new IntSetting.Builder()
+        .name("clear-retries")
+        .description("How many times to re-run a sub-box that still has uncleared blocks (per 'verify-clears') before accepting it and moving on. Each retry re-issues clearArea fresh, so a lag spike that caused the miss has time to pass. Higher = more thorough on laggy servers; the run can never hang because it's capped.")
+        .defaultValue(2)
+        .min(1).max(10).sliderRange(1, 6)
+        .visible(verifyClears::get)
+        .build()
+    );
+
     // ----- Area -----
 
     private final Setting<Boolean> limitArea = sgArea.add(new BoolSetting.Builder()
@@ -703,6 +719,7 @@ public class MassExtractor extends Module {
     private BlockPos unstickPos = null;       // the block the assist is currently holding a break on
     private int unstickTicks = 0;             // ticks spent breaking the current stuck block
     private int unstickBlocksDone = 0;        // assist breaks since the bot last moved (cap before skipping)
+    private int subBoxRetries = 0;            // re-runs of the current sub-box because it verified as not-cleared (cap = clear-retries)
 
     // Drop-collection (State.COLLECT): after a sub-box clears, walk over its dropped kept-items.
     private int[] collectBounds = null;       // {x1,z1,x2,z2} of the sub-box being vacuumed (snapshot)
@@ -2161,6 +2178,7 @@ public class MassExtractor extends Module {
         unstickPos = null;
         unstickTicks = 0;
         unstickBlocksDone = 0;
+        subBoxRetries = 0;
         areaComplete = false;
         curLayerTopY = areaMaxY;               // bounded: sweep from the top layer downward
         areaChunksTotal = areaLimited
@@ -2203,6 +2221,7 @@ public class MassExtractor extends Module {
         }
         buildSubBoxes(x1, z1, x2, z2);
         subBoxIdx = 0;
+        subBoxRetries = 0;
         issueSubBox();
         clearAreaStarted = true;
     }
@@ -2243,6 +2262,7 @@ public class MassExtractor extends Module {
     private void tickClearAreaMining() {
         if (!baritone.getBuilderProcess().isActive()) {
             if (clearAreaStarted) {
+                if (retrySubBoxIfDirty(false)) return;   // lag spike left blocks standing -> re-run the box before advancing
                 beginCollect(false);          // sub-box cleared; vacuum its drops, then next sub-box / chunk
             } else {
                 startClearArea();             // very first chunk of the run
@@ -2257,6 +2277,7 @@ public class MassExtractor extends Module {
             clearAreaStallTicks = 0;
             unstickBlocksDone = 0;            // the bot moved = progress; reset the assist budget
         } else if (++clearAreaStallTicks > CLEARAREA_STALL_TICKS) {
+            if (retrySubBoxIfDirty(true)) return;        // stalled, but blocks remain & retries left -> retry instead of skipping
             warning("clearArea stalled on chunk [%d, %d] sub-box %d/%d (no movement %ds) — skipping.",
                 curCX, curCZ, subBoxIdx + 1, subBoxes.size(), CLEARAREA_STALL_TICKS / 20);
             dbg("clearArea stall: skipping chunk [%d,%d] sub-box %d", curCX, curCZ, subBoxIdx + 1);
@@ -2358,9 +2379,59 @@ public class MassExtractor extends Module {
      * or — once the chunk's last sub-box is done — hand off to {@link #afterChunk(boolean)} to count the
      * chunk and advance the spiral.
      */
+    /**
+     * On a sub-box finishing or stalling, verify the quarry actually cleared it. A lag spike can make
+     * clearArea report a box done (or give up on a stall) with solid blocks still standing. If leftovers
+     * remain and the per-box retry budget isn't spent, re-run the SAME sub-box and return true (the caller
+     * should return — we've re-issued it). Otherwise reset the budget and return false so the caller
+     * advances/collects/skips as normal. Gated by 'verify-clears'.
+     */
+    private boolean retrySubBoxIfDirty(boolean stalled) {
+        if (!verifyClears.get()) return false;
+        if (subBoxRetries >= clearRetries.get() || !subBoxHasLeftovers()) { subBoxRetries = 0; return false; }
+        subBoxRetries++;
+        if (stalled && baritone != null) baritone.getBuilderProcess().onLostControl();
+        info("Sub-box not fully cleared (%s) — retrying it (%d/%d).", stalled ? "stalled" : "lag", subBoxRetries, clearRetries.get());
+        dbg("verify: chunk [%d,%d] sub-box %d/%d still dirty (%s) — retry %d/%d",
+            curCX, curCZ, subBoxIdx + 1, subBoxes.size(), stalled ? "stalled" : "done-early", subBoxRetries, clearRetries.get());
+        issueSubBox();   // re-run clearArea on the same sub-box (resets the stall watch + lastClearPos)
+        timer = nextDelay();
+        return true;
+    }
+
+    /**
+     * True if the current sub-box still holds a solid, breakable block the quarry should have removed.
+     * Scans the box's XZ over the active Y band, ignoring air/replaceable blocks, bedrock, and the two
+     * blocks under the bot (the floor it stands on, which clearArea breaks last from an adjacent spot).
+     * Returns on the first leftover found; cost-capped so a very tall/large box can't stall the tick.
+     */
+    private boolean subBoxHasLeftovers() {
+        if (subBoxes.isEmpty() || subBoxIdx >= subBoxes.size()) return false;
+        int[] b = subBoxes.get(subBoxIdx);
+        int y1 = areaLimited ? curLayerBottomY() : minYLevel.get();
+        int y2 = areaLimited ? curLayerTopY      : quarryTopY;
+        BlockPos feet = mc.player.getBlockPos();
+        int scanned = 0;
+        for (int y = y2; y >= y1; y--) {
+            for (int x = b[0]; x <= b[2]; x++) {
+                for (int z = b[1]; z <= b[3]; z++) {
+                    if (++scanned > 8192) return false;                  // cost cap — assume clear if the box is huge
+                    if (y < minYLevel.get()) continue;
+                    BlockPos p = new BlockPos(x, y, z);
+                    if (p.equals(feet) || p.equals(feet.down())) continue;   // the floor under the bot
+                    var st = mc.world.getBlockState(p);
+                    if (st.isAir() || st.isReplaceable() || st.getBlock() == Blocks.BEDROCK) continue;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private void afterSubBox(boolean stalled) {
         if (subBoxIdx + 1 < subBoxes.size()) {
             subBoxIdx++;
+            subBoxRetries = 0;            // fresh budget for the next sub-box
             issueSubBox();
             timer = nextDelay();
         } else {
