@@ -138,9 +138,9 @@ public class MassExtractor extends Module {
 
     private final Setting<Double> miningReach = sgGeneral.add(new DoubleSetting.Builder()
         .name("mining-reach")
-        .description("How far (in blocks) Baritone may reach to break a block — its 'blockReachDistance', default 4.5. LOWER makes the bot stand closer to each block before mining it, so when the block drops the bot is already within the ~1-block pickup range and grabs it instead of leaving it to despawn. Trades mining speed (more stepping) for collection, which is the point. Pushed only while the module is active and restored when it's turned off; re-enable the module after changing it. ~3.0 collects well; below ~2.5 the bot may struggle to reach some blocks.")
+        .description("How far (in blocks) Baritone may reach to break a block — its 'blockReachDistance', default 4.5. LOWER makes the bot stand closer to each block before mining it, so when the block drops the bot is already within the ~1-block pickup range. Drop pickup is ALSO handled by the post-sub-box vacuum pass now, so reach no longer has to be aggressive. FLOOR 2.7: below that the client crosshair raytrace keeps just missing thin/offset blocks (fences, walls, panes), so the dig never registers — the bot re-sends a 'start break' every tick instead of holding one to completion, and the chunk stalls. (A manual-break assist also recovers from any such stall regardless.) ~3.0 collects well. Pushed only while the module is active and restored when off; re-enable the module after changing it.")
         .defaultValue(3.0)
-        .min(2.0).max(4.5).sliderRange(2.0, 4.5)
+        .min(2.7).max(4.5).sliderRange(2.7, 4.5)
         .build()
     );
 
@@ -553,6 +553,7 @@ public class MassExtractor extends Module {
         SELECT,            // CornerSelect mode: waiting for the player to mark two corners
         MINING,            // Baritone is mining target blocks
         COLLECT,           // vacuum pass: walk over the just-cleared sub-box's drops before the next box
+        UNSTICK,           // manual-break assist: hold a break on a block Baritone stalled on, then resume
         CLEAR_AREA,        // mine a small pocket so the echest + shulker both have room
         PLACE_ECHEST,      // place the ender chest (multi-step)
         ECHEST_TAKE,       // open echest, restock pickaxe, pull an empty shulker (multi-step)
@@ -682,6 +683,26 @@ public class MassExtractor extends Module {
     private static final int CLEARAREA_STALL_TICKS = 20 * 10; // 10s without moving while mining = stuck -> skip box
     private static final int TRAVEL_STALL_TICKS = 20 * 30;    // 30s without moving en route to a base chest = give up
     private boolean wantToEat = false;        // hunger-pause hysteresis: latched once food dips to the eat threshold, cleared when full
+
+    // Reach floor: the lowest blockReachDistance we'll push to Baritone. Below this the client crosshair
+    // raytrace keeps just missing thin/offset blocks (fences/walls), so the dig re-STARTs every tick instead
+    // of holding to completion and the chunk stalls (captured in a 2b packet log: 10x START_DESTROY_BLOCK,
+    // never a STOP). The mining-reach setting's own min matches this.
+    private static final float MIN_MINING_REACH = 2.7f;
+
+    // Manual-break assist (State.UNSTICK): when Baritone stalls mid-mining on a block it can't finish breaking
+    // (the fence/edge-block START-spam above), the addon takes over and HOLDS a break on the offending block
+    // itself — explicit rotation + continuous updateBlockBreakingProgress, exactly like the shulker/echest
+    // breaks — which isn't subject to the low client crosshair reach (vanilla interaction range ~4.5). On
+    // success it hands the sub-box back to Baritone; only if that can't make progress does it fall back to the
+    // original 10s skip. This is the guaranteed-recovery half (the reach floor is the prevent-most half).
+    private static final int UNSTICK_STALL_TICKS = 20 * 3;    // 3s of no movement while mining -> try the assist (well before the 10s skip)
+    private static final int UNSTICK_BREAK_TICKS = 20 * 6;    // hold the break up to 6s per block before giving up on it
+    private static final int UNSTICK_MAX_BLOCKS  = 8;         // consecutive assist-breaks without the bot moving, then skip the sub-box
+    private static final double UNSTICK_REACH    = 4.5;       // vanilla interaction range — independent of the lowered Baritone crosshair reach
+    private BlockPos unstickPos = null;       // the block the assist is currently holding a break on
+    private int unstickTicks = 0;             // ticks spent breaking the current stuck block
+    private int unstickBlocksDone = 0;        // assist breaks since the bot last moved (cap before skipping)
 
     // Drop-collection (State.COLLECT): after a sub-box clears, walk over its dropped kept-items.
     private int[] collectBounds = null;       // {x1,z1,x2,z2} of the sub-box being vacuumed (snapshot)
@@ -1049,7 +1070,10 @@ public class MassExtractor extends Module {
         pushBaritone(s, "allowbreak", true);
         // Stand closer to each block (lower reach) so the bot is within the ~1-block pickup range when
         // the block drops -> it collects the haul instead of leaving it to despawn. Baritone stock 4.5.
-        pushBaritone(s, "blockreachdistance", miningReach.get().floatValue());
+        // Clamp the pushed reach to a workable floor: below ~2.7 the crosshair raytrace keeps missing thin/
+        // offset blocks (fences/walls), so Baritone re-issues START_DESTROY_BLOCK every tick instead of holding
+        // one dig to completion, and the chunk stalls. The setting's own min is 2.7; this guards stale configs.
+        pushBaritone(s, "blockreachdistance", Math.max(MIN_MINING_REACH, miningReach.get().floatValue()));
         // Cap how long Baritone searches for a path it can't find, so a bedrock-encased / lava-fronted
         // block the builder can't reach fails fast instead of freezing for the default 2s/5s. Quarry
         // targets are always near, so a reachable path is found well under 1s.
@@ -1166,6 +1190,7 @@ public class MassExtractor extends Module {
         switch (state) {
             case MINING       -> tickMining();
             case COLLECT      -> tickCollect();
+            case UNSTICK      -> tickUnstick();
             case CLEAR_AREA   -> tickClearArea();
             case PLACE_ECHEST -> tickPlaceEchest();
             case ECHEST_TAKE  -> tickEchestTake();
@@ -2133,6 +2158,9 @@ public class MassExtractor extends Module {
         clearAreaStarted = false;
         clearAreaStallTicks = 0;
         lastClearPos = null;
+        unstickPos = null;
+        unstickTicks = 0;
+        unstickBlocksDone = 0;
         areaComplete = false;
         curLayerTopY = areaMaxY;               // bounded: sweep from the top layer downward
         areaChunksTotal = areaLimited
@@ -2227,13 +2255,102 @@ public class MassExtractor extends Module {
         if (lastClearPos == null || !pos.equals(lastClearPos)) {
             lastClearPos = pos;
             clearAreaStallTicks = 0;
+            unstickBlocksDone = 0;            // the bot moved = progress; reset the assist budget
         } else if (++clearAreaStallTicks > CLEARAREA_STALL_TICKS) {
             warning("clearArea stalled on chunk [%d, %d] sub-box %d/%d (no movement %ds) — skipping.",
                 curCX, curCZ, subBoxIdx + 1, subBoxes.size(), CLEARAREA_STALL_TICKS / 20);
             dbg("clearArea stall: skipping chunk [%d,%d] sub-box %d", curCX, curCZ, subBoxIdx + 1);
             baritone.getBuilderProcess().onLostControl();
             afterSubBox(true);
+        } else if (clearAreaStallTicks == UNSTICK_STALL_TICKS && unstickBlocksDone < UNSTICK_MAX_BLOCKS) {
+            // 3s stalled and we still have assist budget: Baritone is re-issuing START on a block it can't
+            // finish (fence/edge block at low reach). Take over and HOLD the break ourselves before the 10s skip.
+            BlockPos stuck = findStuckBlock();
+            if (stuck != null) {
+                dbg("clearArea stall %ds on [%d,%d] — manual-break assist on %s", UNSTICK_STALL_TICKS / 20, curCX, curCZ, stuck.toShortString());
+                baritone.getBuilderProcess().onLostControl();
+                baritone.getPathingBehavior().cancelEverything();
+                unstickPos = stuck;
+                unstickTicks = 0;
+                go(State.UNSTICK);
+            } else {
+                dbg("clearArea stall assist: no breakable block in reach of the bot — waiting for the skip timer");
+            }
         }
+    }
+
+    // ----- UNSTICK: hold a break on the block Baritone stalled on, then hand the sub-box back -----
+
+    /**
+     * Drive the manual-break assist one tick. Hold a continuous break on {@link #unstickPos} (rotate +
+     * {@link BlockUtils#breakBlock} every tick — one START, progress accumulates, STOP on completion), which
+     * isn't subject to the lowered client crosshair reach the way Baritone's mining is. On success (or after
+     * a per-block timeout) resume clearArea on the same sub-box; if the assist can't make progress (no block,
+     * or budget spent), fall back to the original sub-box skip so the run can never hang.
+     */
+    private void tickUnstick() {
+        if (unstickPos == null) { resumeFromUnstick(false); return; }
+        var st = mc.world.getBlockState(unstickPos);
+        if (st.isReplaceable() || st.getBlock() == Blocks.BEDROCK) {   // broken (or already gone) — success
+            dbg("unstick: broke %s — resuming mining", unstickPos.toShortString());
+            unstickBlocksDone++;
+            resumeFromUnstick(true);
+            return;
+        }
+        if (++unstickTicks > UNSTICK_BREAK_TICKS) {                    // couldn't break it in time
+            dbg("unstick: couldn't break %s in %ds — giving up the assist", unstickPos.toShortString(), UNSTICK_BREAK_TICKS / 20);
+            resumeFromUnstick(false);
+            return;
+        }
+        BlockUtils.breakBlock(unstickPos, true); // continuous held break — runs every tick, no action-delay
+    }
+
+    /** Leave the assist: re-issue the current sub-box to Baritone (on a successful break, with budget left) or
+     *  fall back to skipping the sub-box (assist failed, or too many assists without the bot moving). */
+    private void resumeFromUnstick(boolean broke) {
+        unstickPos = null;
+        unstickTicks = 0;
+        go(State.MINING);
+        if (broke && unstickBlocksDone < UNSTICK_MAX_BLOCKS) {
+            issueSubBox();                       // resume clearArea on the same sub-box (it may now get past the spot)
+            timer = nextDelay();
+        } else {
+            unstickBlocksDone = 0;
+            if (baritone != null) baritone.getBuilderProcess().onLostControl();
+            afterSubBox(true);                   // original behaviour: skip this sub-box so the run can't hang
+        }
+    }
+
+    /**
+     * The block to hand the manual-break assist: the nearest EXPOSED, breakable, non-bedrock block inside the
+     * current sub-box that's within vanilla interaction range (~4.5) of the bot's eyes — i.e. the block
+     * Baritone is almost certainly stalled on. Never the block under the bot's feet (don't drop the floor),
+     * never below the Y floor. Returns null if nothing reachable (then the normal skip timer handles it).
+     */
+    private BlockPos findStuckBlock() {
+        if (subBoxes.isEmpty() || subBoxIdx >= subBoxes.size()) return null;
+        int[] b = subBoxes.get(subBoxIdx);
+        BlockPos feet = mc.player.getBlockPos();
+        int yLo = Math.max(areaLimited ? curLayerBottomY() : minYLevel.get(), feet.getY() - 5);
+        int yHi = Math.min(areaLimited ? curLayerTopY : quarryTopY, feet.getY() + 5);
+        Vec3d eye = mc.player.getEyePos();
+        double bestSq = UNSTICK_REACH * UNSTICK_REACH;
+        BlockPos best = null;
+        for (int x = b[0]; x <= b[2]; x++) {
+            for (int z = b[1]; z <= b[3]; z++) {
+                for (int y = yHi; y >= yLo; y--) {
+                    if (y < minYLevel.get()) continue;
+                    BlockPos p = new BlockPos(x, y, z);
+                    if (p.equals(feet) || p.equals(feet.down())) continue;        // never break the block we stand on
+                    var st = mc.world.getBlockState(p);
+                    if (st.isReplaceable() || st.getBlock() == Blocks.BEDROCK) continue;
+                    if (!isExposed(p)) continue;                                  // must touch air to be mineable from here
+                    double d = eye.squaredDistanceTo(Vec3d.ofCenter(p));
+                    if (d <= bestSq) { bestSq = d; best = p; }
+                }
+            }
+        }
+        return best;
     }
 
     /**
@@ -3402,6 +3519,7 @@ public class MassExtractor extends Module {
     public String getInfoString() {
         if (state == State.PAUSED && wantToEat) return "paused (eating)";
         if (state == State.COLLECT) return "collecting drops";
+        if (state == State.UNSTICK) return "unstick (manual break)";
         if (state == State.SELECT) return "select " + (corner1 == null ? "corner 1" : "corner 2");
         if (state == State.RESTOCK) return "restock " + restockPhase.name().toLowerCase();
         if (state == State.FOOD_RESTOCK) return "food " + foodPhase.name().toLowerCase();
