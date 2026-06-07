@@ -399,6 +399,13 @@ public class MassExtractor extends Module {
         .build()
     );
 
+    private final Setting<Boolean> stopToolFight = sgTools.add(new BoolSetting.Builder()
+        .name("stop-tool-fight")
+        .description("Auto-heal the hotbar 'tool tug-of-war': when Baritone's auto-tool and Meteor's AutoTool disagree on which tool to hold, they flip the SELECTED hotbar slot dozens of times a second, which cancels every block break and freezes the chunk (caught in a packet log: slot 3<->6, ~30x/s, breaks never completing — and the manual-break assist / verify-retry can't help because nothing can hold a break through it). When such a thrash is detected, the addon disables BARITONE's auto-tool so a single selector (Meteor's AutoTool) stays in control and the dig can hold; restored when the module is turned off. Safe to leave on even if you don't run Meteor AutoTool — it only ever triggers on a real thrash, and a lone selector never thrashes.")
+        .defaultValue(true)
+        .build()
+    );
+
     private final Setting<Boolean> pauseOnHazard = sgSafety.add(new BoolSetting.Builder()
         .name("pause-on-hazard")
         .description("Pause if lava is adjacent or a non-friendly player is nearby.")
@@ -684,6 +691,17 @@ public class MassExtractor extends Module {
     private final java.util.Random random = new java.util.Random();
     // Baritone settings we changed this run -> their original values, restored on deactivate.
     private final java.util.Map<String, Object> savedBaritone = new java.util.HashMap<>();
+
+    // Tool-fight auto-heal (see 'stop-tool-fight'): two tool-selectors (Baritone auto-tool vs Meteor
+    // AutoTool) can flip the selected hotbar slot every tick, cancelling every break. We sample the selected
+    // slot each mining tick; if it changes too many times within a 1s window it's a thrash, and we push
+    // Baritone autotool=false ONCE (restored on deactivate) to leave a single selector in charge.
+    private int selSlotPrev = -1;
+    private int toolSwitchCount = 0;
+    private int toolWindowTicks = 0;
+    private boolean baritoneAutoToolSuppressed = false;
+    private static final int TOOL_FIGHT_SWITCHES = 10;  // >= this many selected-slot changes within the window = a fight
+    private static final int TOOL_FIGHT_WINDOW = 20;     // 1s sampling window
     private static final Direction[] HORIZONTAL = { Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST };
 
     // Outward chunk spiral (chunk coords). startC* is the spiral centre captured at activation;
@@ -839,6 +857,10 @@ public class MassExtractor extends Module {
         foodShulkerEmptied = false;
         foodRestockExhausted = false;
         foodReturnedBefore = -1;
+        selSlotPrev = -1;
+        toolSwitchCount = 0;
+        toolWindowTicks = 0;
+        baritoneAutoToolSuppressed = false;
         depositActive = (depositTarget.get() != DepositTarget.EnderChest);
         echestExhausted = false;
         depositPhase = DepositPhase.PATH_TO_DEPOSIT;
@@ -1227,7 +1249,33 @@ public class MassExtractor extends Module {
 
     // ----- MINING -----
 
+    /**
+     * Auto-heal the hotbar tool tug-of-war (see 'stop-tool-fight'). Sampled each mining tick: if the SELECTED
+     * hotbar slot is changing many times a second, two tool-selectors (Baritone's auto-tool and Meteor's
+     * AutoTool) are fighting and every break is being cancelled. We then disable Baritone's auto-tool (pushed
+     * by name, snapshotted so deactivate restores it) so a single selector stays in control. Latches — once
+     * suppressed this run, we stop checking. The addon never changes the selected slot during MINING itself,
+     * so a thrash here is always external.
+     */
+    private void detectToolFight() {
+        if (!stopToolFight.get() || baritoneAutoToolSuppressed) return;
+        int sel = mc.player.getInventory().selectedSlot;
+        if (selSlotPrev != -1 && sel != selSlotPrev) toolSwitchCount++;
+        selSlotPrev = sel;
+        if (++toolWindowTicks >= TOOL_FIGHT_WINDOW) {
+            if (toolSwitchCount >= TOOL_FIGHT_SWITCHES) {
+                pushBaritone(BaritoneAPI.getSettings(), "autotool", false);
+                baritoneAutoToolSuppressed = true;
+                warning("Tool tug-of-war detected (hotbar slot thrashing %dx/s) — disabled Baritone's auto-tool so breaks can hold (Meteor AutoTool keeps selecting).", toolSwitchCount);
+                dbg("tool-fight: %d selected-slot switches in %dt -> pushed baritone autotool=false", toolSwitchCount, TOOL_FIGHT_WINDOW);
+            }
+            toolSwitchCount = 0;
+            toolWindowTicks = 0;
+        }
+    }
+
     private void tickMining() {
+        detectToolFight();   // auto-heal the hotbar tool tug-of-war that freezes breaks (see 'stop-tool-fight')
         // One junk item per action-delay so dropping can never burst a stack of packets.
         if (dropJunk.get() && dropOneJunk()) { timer = nextDelay(); return; }
 
