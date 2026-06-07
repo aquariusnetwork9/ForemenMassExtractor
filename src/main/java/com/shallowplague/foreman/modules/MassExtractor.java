@@ -401,7 +401,7 @@ public class MassExtractor extends Module {
 
     private final Setting<Boolean> stopToolFight = sgTools.add(new BoolSetting.Builder()
         .name("stop-tool-fight")
-        .description("Auto-heal the hotbar 'tool tug-of-war': when Baritone's auto-tool and Meteor's AutoTool disagree on which tool to hold, they flip the SELECTED hotbar slot dozens of times a second, which cancels every block break and freezes the chunk (caught in a packet log: slot 3<->6, ~30x/s, breaks never completing — and the manual-break assist / verify-retry can't help because nothing can hold a break through it). When such a thrash is detected, the addon disables BARITONE's auto-tool so a single selector (Meteor's AutoTool) stays in control and the dig can hold; restored when the module is turned off. Safe to leave on even if you don't run Meteor AutoTool — it only ever triggers on a real thrash, and a lone selector never thrashes.")
+        .description("Defer tool selection to Meteor's AutoTool to kill the hotbar 'tool tug-of-war'. When Baritone's auto-tool and Meteor's AutoTool both run they fight over the selected hotbar slot (flipping it ~30x/s), which cancels every block break and freezes the chunk (caught in a packet log: slot 3<->6, breaks never completing — and the manual-break assist / verify-retry can't help because nothing can hold a break through it). With this on: if Meteor's AutoTool is enabled the addon disables BARITONE's auto-tool UP FRONT (on activate) so the fight never starts; and as a backstop it also disables it if a slot thrash is detected mid-run (e.g. AutoTool toggled on later). Restored when the module is turned off. If you DON'T run Meteor AutoTool nothing changes — Baritone keeps picking tools. Meteor's AutoTool is the better/cleaner picker anyway.")
         .defaultValue(true)
         .build()
     );
@@ -861,6 +861,15 @@ public class MassExtractor extends Module {
         toolSwitchCount = 0;
         toolWindowTicks = 0;
         baritoneAutoToolSuppressed = false;
+        // Proactively defer tool selection to Meteor's AutoTool when it's running, so the Baritone-vs-Meteor
+        // hotbar tug-of-war never even starts (no ~1s detect window). detectToolFight() stays as a backstop
+        // for AutoTool toggled on AFTER activation. (Pushed after applyBaritoneSettings + the reset above, so
+        // it isn't clobbered; snapshotted by pushBaritone so deactivate restores Baritone's auto-tool.)
+        if (stopToolFight.get() && meteorAutoToolActive()) {
+            pushBaritone(BaritoneAPI.getSettings(), "autotool", false);
+            baritoneAutoToolSuppressed = true;
+            dbg("tool-fight: Meteor AutoTool active on activate -> proactively pushed baritone autotool=false");
+        }
         depositActive = (depositTarget.get() != DepositTarget.EnderChest);
         echestExhausted = false;
         depositPhase = DepositPhase.PATH_TO_DEPOSIT;
@@ -1248,6 +1257,17 @@ public class MassExtractor extends Module {
     }
 
     // ----- MINING -----
+
+    /** True if Meteor's AutoTool module is enabled — then it's the sole tool selector once Baritone's is off. */
+    private boolean meteorAutoToolActive() {
+        try {
+            return meteordevelopment.meteorclient.systems.modules.Modules.get()
+                .isActive(meteordevelopment.meteorclient.systems.modules.player.AutoTool.class);
+        } catch (Throwable t) {
+            dbg("meteorAutoToolActive check failed: %s", t.toString());
+            return false;
+        }
+    }
 
     /**
      * Auto-heal the hotbar tool tug-of-war (see 'stop-tool-fight'). Sampled each mining tick: if the SELECTED
