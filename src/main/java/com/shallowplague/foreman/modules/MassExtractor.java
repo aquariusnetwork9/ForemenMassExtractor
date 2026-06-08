@@ -1311,13 +1311,27 @@ public class MassExtractor extends Module {
         // occupancy, means reserved items (echest stack, spare tools, food) never trigger early,
         // and partial target stacks keep filling (vanilla merges into them before consuming an
         // empty) so we don't store until the inventory is actually full.
-        boolean invFull = requireFullStacks.get()
+        boolean normalFull = requireFullStacks.get()
             ? !canHoldMoreTarget()                              // every target stack at 64, no empty slot
             : emptyMainSlots() <= freeSlotsBeforeStore.get();   // legacy: empty-slot margin
+        // Overflow guard (Option A): with require-full-stacks the cycle waits for EVERY stack to hit 64.
+        // But when one target type is far more abundant than another (e.g. cobbled deepslate vs tuff), the
+        // abundant type fills the main inventory to 0 empties while the rare type leaves a partial stack
+        // <64 — so canHoldMoreTarget() stays true and the bot spirals on forever. New abundant drops then
+        // spill into the hotbar, where sweepHotbarTargets() above can't relocate them (main is full), and
+        // once the hotbar fills too they despawn on the ground — large losses. Detect that exact state
+        // (main full + target stranded in the hotbar) and store NOW regardless of partial stacks. The fill
+        // pulls from the hotbar too (findPlayerSlotInContainer scans all 36 slots), so the overflow is
+        // stored, not dropped.
+        boolean overflowStranded = emptyMainSlots() == 0 && hotbarHasTarget();
+        boolean invFull = normalFull || overflowStranded;
         if (invFull && hasTargetStacks()) {                      // never start a cycle with nothing to store
             stopMining();
-            dbg("inventory full (%s) — starting storage cycle",
-                requireFullStacks.get() ? "all stacks at 64" : "emptyMain<=" + freeSlotsBeforeStore.get());
+            if (!normalFull && overflowStranded)
+                info("Inventory packed and target overflowing into the hotbar — storing now instead of spiralling to top off a partial stack.");
+            dbg("inventory full (%s%s) — starting storage cycle",
+                requireFullStacks.get() ? "all stacks at 64" : "emptyMain<=" + freeSlotsBeforeStore.get(),
+                overflowStranded ? " / overflow-guard" : "");
             if (countItem(Items.ENDER_CHEST) == 0) { pause("No ender chest in inventory."); return; }
             restocking = false;                                  // CLEAR_AREA routes to the storage cycle
             go(State.CLEAR_AREA);
@@ -2827,6 +2841,14 @@ public class MassExtractor extends Module {
 
     private boolean hasTargetStacks() {
         for (int i = 0; i < 36; i++) if (isTargetStack(mc.player.getInventory().getStack(i))) return true;
+        return false;
+    }
+
+    /** True if any hotbar slot (0-8) holds a target stack — overflow that sweepHotbarTargets() couldn't
+     *  relocate because the main inventory is full. Feeds the storage overflow guard in tickMining(). */
+    private boolean hotbarHasTarget() {
+        var inv = mc.player.getInventory();
+        for (int i = 0; i <= 8; i++) if (isTargetStack(inv.getStack(i))) return true;
         return false;
     }
 
