@@ -36,8 +36,12 @@ jobs:
         uses: gradle/actions/setup-gradle@v6
 
       - name: Build with Gradle
+        # Tags up to v1.3.5 were committed with gradlew at mode 100644 (no exec bit),
+        # so make it runnable before invoking it.
         # Override the Windows JDK path pinned in gradle.properties with the runner's JDK 21.
-        run: ./gradlew build -Dorg.gradle.java.home="$JAVA_HOME"
+        run: |
+          chmod +x ./gradlew
+          ./gradlew build -Dorg.gradle.java.home="$JAVA_HOME"
 
       - name: Publish Release
         uses: softprops/action-gh-release@v3
