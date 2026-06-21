@@ -5,6 +5,10 @@ on:
     branches:
       - '**'
 
+permissions:
+  # Required for the snapshot release step; the repo's default token is read-only.
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
