@@ -1,9 +1,17 @@
-name: Publish Development Build
+name: Publish Release
+
 on:
   push:
-    # Branch pushes only — release tags are handled by release.yml.
-    branches:
-      - '**'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag to build and publish as the official release (e.g. v1.3.5)'
+        required: true
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -13,6 +21,8 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v6
         with:
+          # On a tag push, build that tag; on manual dispatch, build the tag the user named.
+          ref: ${{ github.event.inputs.tag || github.ref }}
           persist-credentials: false
 
       - name: Set up Java
@@ -29,12 +39,14 @@ jobs:
         # Override the Windows JDK path pinned in gradle.properties with the runner's JDK 21.
         run: ./gradlew build -Dorg.gradle.java.home="$JAVA_HOME"
 
-      - name: Release
+      - name: Publish Release
         uses: softprops/action-gh-release@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          tag_name: snapshot
-          name: Dev Build
-          prerelease: true
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          # Official release, not a prerelease. An existing release for the tag is updated
+          # in place (its name/notes are preserved) and the built jar is attached.
+          prerelease: false
+          fail_on_unmatched_files: true
           files: |
             ./build/libs/*.jar
