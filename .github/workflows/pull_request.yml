@@ -11,17 +11,19 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
-
       - name: Set up Java
         uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
-          java-version: 25
+          # Loom 1.8 + Gradle 8.10 require JDK <= 21.
+          java-version: 21
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
 
       - name: Build with Gradle
-        run: ./gradlew build
+        # Override the Windows JDK path pinned in gradle.properties with the runner's JDK 21.
+        run: ./gradlew build -Dorg.gradle.java.home="$JAVA_HOME"
 
       - name: Release
         uses: actions/upload-artifact@v7
